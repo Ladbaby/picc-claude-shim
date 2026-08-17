@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Claude Code drop-in shim backed by pi (drop-in for hapi/Claude Code).
+# POSIX-portable entry script.
+
+set -euo pipefail
+
+SHIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$SHIM_DIR/claude.js" "$@"

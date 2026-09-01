@@ -3,6 +3,10 @@
  * Run all pi-claude-shim unit tests. Used as a one-shot smoke check.
  *
  *   node test/run-all.mjs
+ *
+ * Note: `entry.e2e.test.ts` is intentionally NOT in this list — it spawns
+ * the real shim and needs a live pi model + API key. Run it separately via
+ * `node test/run-e2e.mjs`.
  */
 
 import { createJiti } from "jiti";
@@ -13,6 +17,7 @@ const tests = [
   "tool-names.test.ts",
   "session-jsonl.test.ts",
   "cost.test.ts",
+  "permission-gate.test.ts",
   "translator.test.ts",
   "translator-out.test.ts",
 ];

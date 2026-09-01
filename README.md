@@ -52,6 +52,12 @@ unless you pass `--force`. The alternative is to set
 hapi's `cli/src/claude/sdk/utils.ts:145-200` already honors for Claude Code
 overrides).
 
+Note: `bin/claude.cmd` in the source tree is a **template** — it carries a
+`__SHIM_BIN_PLACEHOLDER__` that `install.js` replaces with the real path when
+it writes the installed copy. The directly-runnable entries are the POSIX
+`bin/claude` and `bin/claude.js`; run those (or the installed `claude.cmd`)
+rather than the source-tree template.
+
 ## How hapi drives the shim
 
 When you run `hapi` against a session, hapi invokes `claudeRemote` which
@@ -116,12 +122,19 @@ node test/run-all.mjs
 
 Tests cover:
 - `args.test.ts` — flag parsing (`--output-format`, `--permission-prompt-tool`, etc.)
-- `tool-names.test.ts` — Claude/Anthropic ↔ pi tool name mapping
+- `tool-names.test.ts` — Claude/Anthropic ↔ pi tool name mapping (case-insensitive)
 - `session-jsonl.test.ts` — hapi JSONL writer
 - `cost.test.ts` — usage + cost synthesis
+- `permission-gate.test.ts` — when the permission gate is open/closed
 - `translator.test.ts` — stdin → pi calls
-- `translator-out.test.ts` — pi events → Claude NDJSON
-- `entry.e2e.test.ts` — full end-to-end subprocess handshake
+- `translator-out.test.ts` — pi events → Claude NDJSON (result fields, control_request)
+
+`entry.e2e.test.ts` is a separate, live-backend test (needs a configured pi
+model + API key) and is not part of `run-all.mjs`. Run it with:
+
+```bash
+node test/run-e2e.mjs
+```
 
 ## Files
 
@@ -133,7 +146,7 @@ extensions/pi-claude-shim/
 ├── README.md
 ├── bin/
 │   ├── claude.js        # Node entry; imports src/entry.ts via jiti
-│   ├── claude.cmd       # Windows entry that forwards to claude.js
+│   ├── claude.cmd       # Windows entry template (install.js fills in the path)
 │   └── claude           # POSIX entry
 ├── src/
 │   ├── index.ts         # Extension factory (no-op; registers --claude-shim-install flag)
@@ -141,19 +154,19 @@ extensions/pi-claude-shim/
 │   ├── args.ts          # parseClaudeArgs — Claude-flavored argv parser
 │   ├── translator.ts    # bi-directional event/message translation
 │   ├── session-jsonl.ts # hapi-compatible session JSONL writer
-│   ├── tool-names.ts    # PascalCase ↔ lowercase tool name mapping
-│   ├── cost.ts          # synthesizeUsageAndCost from pi's SessionStats
-│   └── types.ts         # (reserved for future shared types)
+│   ├── tool-names.ts    # case-insensitive tool name mapping (find ↔ Glob, etc.)
+│   └── cost.ts          # synthesizeUsageAndCost from pi's SessionStats
 └── test/
     ├── args.test.ts
     ├── tool-names.test.ts
     ├── session-jsonl.test.ts
     ├── cost.test.ts
+    ├── permission-gate.test.ts
     ├── translator.test.ts
     ├── translator-out.test.ts
     ├── entry.e2e.test.ts
     ├── run-all.mjs      # Run all unit tests
-    └── run-e2e.mjs      # Run e2e test specifically
+    └── run-e2e.mjs      # Run the e2e test specifically
 ```
 
 ## Design choices
@@ -168,14 +181,24 @@ extensions/pi-claude-shim/
   lookup. Pi has no API to alias itself as `claude`. The install script
   drops a thin wrapper at `~/.local/bin/claude.cmd`.
 
-- **Tool name mapping:** built-ins (Read, Write, Edit, Bash, Grep, Glob,
-  LS) map identity-modulo-case. Unknown tools (TodoWrite, WebSearch,
-  etc.) are not yet supported; if a tool-call gate asks permission for
-  one, the shim replies with `control_response{behavior:"deny"}`.
+- **Tool name mapping:** the mapping is case-insensitive in both directions
+  to match picc's registered tool names, which may be lowercase (`read`,
+  `bash`, `grep`) or PascalCase (`Read`, `Edit`, `Glob`). pi's `find` maps to
+  Claude's `Glob` (picc-glob accepts both `Glob` and `find`); the other
+  built-ins map identity-modulo-case. Unknown tools (TodoWrite, WebSearch,
+  etc.) are not yet supported; if a tool-call gate asks permission for one,
+  the shim replies with `control_response{behavior:"deny"}`.
 
-- **Thinking blocks:** dropped on the wire for now. pi's `thinking_delta`
-  events are observed but not emitted; consumers can still see them in
-  the JSONL session log.
+- **Permission gate:** `control_request` round-trips happen only when the
+  parent passes `--permission-prompt-tool stdio` **and** the mode is not
+  `bypassPermissions`. Without the stdio flag the gate stays closed even in
+  a non-bypass permission mode, so a plain `claude` invocation never blocks
+  on a permission prompt.
+
+- **Thinking blocks:** emitted as `thinking` content blocks in the assistant
+  message. pi's `thinking_delta` events are accumulated and flushed on
+  `message_end`; Claude's protocol has a `thinking` block type, so they are
+  passed through rather than dropped.
 
 - **Cost & duration:** `total_cost_usd` is taken straight from pi's
   `SessionStats.cost` (which pi calculates against the model's pricing).

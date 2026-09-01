@@ -48,6 +48,7 @@ import {
   type SDKMessageOut,
 } from "./translator.js";
 import { fromClaudeToolName } from "./tool-names.js";
+import { synthesizeUsageAndCost } from "./cost.js";
 import { createInterface } from "node:readline";
 
 const PI_VERSION = "0.0.1-pi-claude-shim";
@@ -62,12 +63,19 @@ function logStartupBanner(opts: ClaudeShimOptions, mode: string): void {
 }
 
 /**
- * Translate Claude's permission modes onto a wire-gate boolean:
- *   - `bypassPermissions` → gate closed (do not ask)
- *   - everything else      → gate open
+ * Decide whether the permission gate is open — i.e. whether the shim emits
+ * `control_request` for tool calls and waits for a `control_response`.
+ *
+ * The gate is open only when the parent explicitly asks for stdio permission
+ * prompts (`--permission-prompt-tool stdio`) AND the mode is not
+ * `bypassPermissions`. Exported as a pure function so it can be unit-tested
+ * without spinning up a session.
  */
-function gateIsOpen(mode: ClaudePermissionMode | undefined): boolean {
-  return mode !== "bypassPermissions";
+export function computeGateOpen(
+  permissionPromptTool: "stdio" | undefined,
+  permissionMode: ClaudePermissionMode | undefined,
+): boolean {
+  return permissionPromptTool === "stdio" && permissionMode !== "bypassPermissions";
 }
 
 function resolveCwd(): string {
@@ -152,9 +160,12 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     modelId,
   });
 
-  // 2. Permission gate wiring: skip when bypassPermissions, otherwise
-  //    block in `handleAgentEvent` permission flow via control_request.
-  const gateOpen = gateIsOpen(opts.permissionMode);
+  // 2. Permission gate wiring: the gate is open only when the parent
+  //    explicitly asks for stdio permission prompts AND the mode is not
+  //    bypassPermissions. hapi sends `--permission-prompt-tool stdio` to
+  //    request control_request round-trips; without that flag we never
+  //    emit control_request, even in a non-bypass permission mode.
+  const gateOpen = computeGateOpen(opts.permissionPromptTool, opts.permissionMode);
 
   // 3. Build a stdio writer + translator state.
   const state: TranslatorState = createTranslatorState({
@@ -170,6 +181,11 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   //    `control_response`, we resolve the pending promise and unblock
   //    the agent loop.
   const pending = new Map<string, PendingPermission>();
+
+  // Tracks whether the run hit an error (prompt rejection or an assistant
+  // `error` event) so the final `result` reports `error_during_execution`
+  // instead of `success`.
+  let runErrored = false;
 
   const permissionAsk = async (
     toolName: string,
@@ -201,6 +217,11 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
 
   // 5. Subscribe to pi events.
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+    // Surface assistant-level errors (e.g. a failed turn) so the final
+    // result reports error_during_execution rather than success.
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "error") {
+      runErrored = true;
+    }
     translateAgentEvent(state, event, {
       cwd,
       modelId,
@@ -270,6 +291,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
             void session
               .prompt(text, streamBehavior ? { streamingBehavior: streamBehavior } : {})
               .catch((e: unknown) => {
+                runErrored = true;
                 process.stderr.write(
                   `pi-claude-shim: prompt failed: ${(e as Error).message}\n`,
                 );
@@ -327,12 +349,12 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   const stats = typeof session.getSessionStats === "function"
     ? session.getSessionStats()
     : undefined;
-  const synthesis = (await import("./cost.js")).synthesizeUsageAndCost(
+  const synthesis = synthesizeUsageAndCost(
     stats,
     state.emitter.startedAtMs,
     modelId,
   );
-  emitResult(state, synthesis, session.sessionId, false, false);
+  emitResult(state, synthesis, session.sessionId, runErrored, false);
 
   // 11. Cleanup.
   rl.close();
@@ -409,8 +431,20 @@ async function buildPiSession(
   const loader = new DefaultResourceLoader(loaderOptions);
   await loader.reload();
 
-  const sessionManager = (() => {
-    if (opts.resume || opts.continueConversation) {
+  const sessionManager = await (async () => {
+    if (opts.resume) {
+      // Resolve the specific session id to its file, then open it. Fall
+      // back to a fresh session if the id is not found.
+      try {
+        const infos = await SessionManager.list(cwd);
+        const match = infos.find((info) => info.id === opts.resume);
+        if (match) return SessionManager.open(match.path, undefined, cwd);
+      } catch {
+        // fall through to a fresh session
+      }
+      return SessionManager.create(cwd);
+    }
+    if (opts.continueConversation) {
       try {
         return SessionManager.continueRecent(cwd);
       } catch {

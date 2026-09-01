@@ -10,6 +10,7 @@ import { Writable } from "node:stream";
 import {
   createAssistantBuffer,
   createTranslatorState,
+  emitControlRequest,
   emitResult,
   emitSystemInit,
   flushAssistantBuffer,
@@ -85,16 +86,16 @@ emitSystemInit(state, "session-1", {
 assertEq(col.lines.length, 0, "system/init idempotent");
 
 // 3. Assistant message_start + text deltas + message_end flushes content.
+//    The buffer is keyed on `message.timestamp`, so put it on the message.
 col.lines = [];
 const ts = "1700000000000";
 handleAgentEvent(state, {
   type: "message_start",
-  message: { role: "assistant", content: [] } as never,
-  timestamp: ts,
+  message: { role: "assistant", content: [], timestamp: ts } as never,
 } as never, {} as never);
 handleAgentEvent(state, {
   type: "message_update",
-  message: { role: "assistant", content: [] } as never,
+  message: { role: "assistant", content: [], timestamp: ts } as never,
   assistantMessageEvent: {
     type: "text_delta",
     contentIndex: 0,
@@ -104,7 +105,7 @@ handleAgentEvent(state, {
 } as never, {} as never);
 handleAgentEvent(state, {
   type: "message_update",
-  message: { role: "assistant", content: [] } as never,
+  message: { role: "assistant", content: [], timestamp: ts } as never,
   assistantMessageEvent: {
     type: "text_delta",
     contentIndex: 0,
@@ -117,8 +118,8 @@ handleAgentEvent(state, {
   message: {
     role: "assistant",
     content: [{ type: "text", text: "hello world" }],
+    timestamp: ts,
   } as never,
-  timestamp: ts,
 } as never, {} as never);
 const flushed = col.messages().find((m) => m.type === "assistant");
 assertEq(flushed !== undefined, true, "assistant message flushed");
@@ -139,7 +140,12 @@ assertEq(
   assertEq(JSON.stringify(types), JSON.stringify(["text", "tool_use", "thinking"]), "buffer flushes all three blocks");
 }
 
-// 5. emitResult writes a `result` message with usage.
+// 5. num_turns increments per turn_end and is reported in result.
+col.lines = [];
+for (let i = 0; i < 3; i++) handleAgentEvent(state, { type: "turn_end" } as never, {} as never);
+assertEq(state.numTurns, 3, "num_turns counts turn_end");
+
+// 6. emitResult writes a `result` message; usage/cost round-trip.
 col.lines = [];
 const synth = synthesizeUsageAndCost(
   {
@@ -154,4 +160,39 @@ const result = col.messages().find((m) => m.type === "result")!;
 assertEq(result.type, "result", "result type");
 assertEq((result as { subtype: string }).subtype, "success", "result subtype");
 assertEq((result as { session_id: string }).session_id, "session-1", "result session_id");
-assertEq((result as { num_turns: number }).num_turns >= 0, true, "result num_turns");
+assertEq((result as { num_turns: number }).num_turns, 3, "result num_turns is 3");
+assertEq((result as { total_cost_usd: number }).total_cost_usd, 0.001, "result total_cost_usd");
+assertEq((result as { usage: { input_tokens: number } }).usage?.input_tokens, 10, "result usage input_tokens");
+assertEq(
+  (result as { modelUsage: Record<string, unknown> }).modelUsage["claude-sonnet"] !== undefined,
+  true,
+  "result modelUsage present",
+);
+
+// 7. Error result: isError flips subtype to error_during_execution.
+col.lines = [];
+emitResult(state, synth, "session-1", true, false);
+const errResult = col.messages().find((m) => m.type === "result")!;
+assertEq(
+  (errResult as { subtype: string }).subtype,
+  "error_during_execution",
+  "error result subtype",
+);
+
+// 8. control_request output shape.
+{
+  const before = col.lines.length;
+  const requestId = emitControlRequest(state, "Bash", { command: "ls" }, "toolu_x");
+  const req = col.messages()[col.messages().length - 1] as {
+    type: string;
+    request_id: string;
+    request: { subtype: string; tool_name: string; input: unknown };
+  };
+  assertEq(requestId.length > 0, true, "control_request returns id");
+  assertEq(req.type, "control_request", "control_request type");
+  assertEq(req.request_id, requestId, "control_request id matches");
+  assertEq(req.request.subtype, "can_use_tool", "control_request subtype");
+  assertEq(req.request.tool_name, "Bash", "control_request tool_name");
+  assertEq(JSON.stringify(req.request.input), JSON.stringify({ command: "ls" }), "control_request input");
+  assertEq(col.lines.length > before, true, "control_request emitted a line");
+}

@@ -91,15 +91,14 @@ assertEq(userTextSeen, "world\n!!", "user array content joined");
     }),
     { pendingPermissions: pending, onUserMessage: () => {} },
   );
-  promise.then((r) => {
-    assertEq(r.behavior, "allow", "control_response allow behavior");
-    // updatedInput carried through
-    assertEq(
-      JSON.stringify(r),
-      JSON.stringify({ behavior: "allow", updatedInput: { foo: 1 } }),
-      "control_response payload",
-    );
-  });
+  const r = await promise;
+  assertEq(r.behavior, "allow", "control_response allow behavior");
+  // updatedInput carried through
+  assertEq(
+    JSON.stringify(r),
+    JSON.stringify({ behavior: "allow", updatedInput: { foo: 1 } }),
+    "control_response payload",
+  );
 }
 
 // 4. control_response error subtype -> deny
@@ -117,14 +116,13 @@ assertEq(userTextSeen, "world\n!!", "user array content joined");
     }),
     { pendingPermissions: pending, onUserMessage: () => {} },
   );
-  promise.then((r) => {
-    assertEq(r.behavior, "deny", "error subtype -> deny");
-    assertEq(
-      JSON.stringify(r),
-      JSON.stringify({ behavior: "deny", message: "user rejected" }),
-      "error message relayed",
-    );
-  });
+  const r = await promise;
+  assertEq(r.behavior, "deny", "error subtype -> deny");
+  assertEq(
+    JSON.stringify(r),
+    JSON.stringify({ behavior: "deny", message: "user rejected" }),
+    "error message relayed",
+  );
 }
 
 // 5. control_cancel_request -> deny with cancelled message
@@ -135,10 +133,9 @@ assertEq(userTextSeen, "world\n!!", "user array content joined");
     JSON.stringify({ type: "control_cancel_request", request_id: reqId }),
     { pendingPermissions: pending, onUserMessage: () => {} },
   );
-  promise.then((r) => {
-    assertEq(r.behavior, "deny", "cancel -> deny");
-    assertEq((r as { message: string }).message, "cancelled by client", "cancel message");
-  });
+  const r = await promise;
+  assertEq(r.behavior, "deny", "cancel -> deny");
+  assertEq((r as { message?: string }).message, "cancelled by client", "cancel message");
 }
 
 // 6. malformed JSON returns null and does not throw.
@@ -162,6 +159,3 @@ assertEq(userTextSeen, "world\n!!", "user array content joined");
   }
   assertEq(thrown, false, "unknown message shape does not throw");
 }
-
-// Async assertions: give the promises a tick to resolve.
-await new Promise((r) => setTimeout(r, 0));

@@ -6,7 +6,7 @@
 
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   appendSessionEntry,
   computeHapiProjectDir,
@@ -31,21 +31,14 @@ process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
 
 const cwd = "C:\\Users\\Test\\Projects\\My App";
 
-// 1. computeHapiProjectDir strips non-alphanumerics. On Windows the
-//    drive letter colon AND the backslash separators both get replaced,
-//    producing a double-dash for the drive boundary.
+// 1. computeHapiProjectDir strips non-alphanumerics. We derive the expected
+//    id from the SAME transform the code applies (resolve then replace) so the
+//    assertion is exact and platform-independent.
 {
   const dir = computeHapiProjectDir(cwd);
-  // hapi's path.ts: resolve(cwd).replace(/[^a-zA-Z0-9]/g, '-')
-  // For "C:\\Users\\Test\\Projects\\My App" the leading "C:" produces
-  // "C-" (drive letter + colon) and the backslash becomes "-", so the
-  // project id is "C--Users-Test-Projects-My-App".
-  const expectedProjectId = "C--Users-Test-Projects-My-App";
-  assertEq(
-    dir.endsWith(expectedProjectId),
-    true,
-    `project dir endsWith ${expectedProjectId} (got ${dir})`,
-  );
+  const expectedId = resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+  const expectedDir = join(claudeConfigDir, "projects", expectedId);
+  assertEq(dir, expectedDir, `project dir exact (got ${dir})`);
 }
 
 // 2. computeHapiSessionPath joins sessionId.jsonl under the project dir.
@@ -93,5 +86,7 @@ const cwd = "C:\\Users\\Test\\Projects\\My App";
   assertEq(entry.uuid, uuid, "appended uuid matches return");
 }
 
-// Cleanup
+// Cleanup: restore the environment and remove the temp tree so the env
+// mutation does not leak into tests that run later in the same process.
+delete process.env.CLAUDE_CONFIG_DIR;
 rmSync(tmpDir, { recursive: true, force: true });

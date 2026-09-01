@@ -32,10 +32,10 @@
 
 import { randomUUID } from "node:crypto";
 import type { AssistantMessage, Message, ToolCall } from "@earendil-works/pi-ai";
-import type { AgentEvent } from "@earendil-works/pi-agent-core";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { toClaudeToolName } from "./tool-names.js";
 import {
-  synthesizeUsageAndCost,
+  type SynthesizedModelUsage,
   type SynthesizedResultFields,
 } from "./cost.js";
 
@@ -106,6 +106,7 @@ export interface SDKResultMessage {
   duration_api_ms: number;
   is_error: boolean;
   session_id: string;
+  modelUsage?: Record<string, SynthesizedModelUsage>;
 }
 
 export interface SDKControlRequest {
@@ -286,8 +287,9 @@ export function handleClaudeInput(
   }
 }
 
-function extractUserText(m: { message?: { role?: string; content?: unknown } }): string | null {
-  const content = m.message?.content;
+function extractUserText(m: Record<string, unknown>): string | null {
+  const message = m.message as { content?: unknown } | undefined;
+  const content = message?.content;
   if (typeof content === "string") {
     return content.length > 0 ? content : null;
   }
@@ -329,7 +331,12 @@ export interface EmitterContext extends OutputEmitter {
 export interface TranslatorDeps {
   cwd: string;
   modelId: string;
-  buildSynthesis: () => SynthesizedResultFields | Promise<SynthesizedResultFields>;
+  /**
+   * Compute the result synthesis. Optional: the entry orchestrator computes
+   * it directly from `session.getSessionStats()` at `agent_end`, so it need
+   * not be supplied up front.
+   */
+  buildSynthesis?: () => SynthesizedResultFields | Promise<SynthesizedResultFields>;
   /** Compute the current set of available tools (PascalCase). */
   toolsAvailable: () => string[];
   /** Optional slash commands list. Empty for the shim. */
@@ -400,7 +407,7 @@ export function emitSystemInit(
  */
 export function handleAgentEvent(
   state: TranslatorState,
-  event: AgentEvent,
+  event: AgentSessionEvent,
   deps: TranslatorDeps,
   permissionAsk?: (
     toolName: string,
@@ -497,15 +504,18 @@ export function handleAgentEvent(
           return undefined;
         }
         case "toolcall_end": {
-          const toolCall = (ev.partial.content[ev.contentIndex] ?? {}) as Partial<ToolCall>;
-          const id = toolCall.id ?? "";
-          if (!id) return undefined;
-          const accum = buf.toolUses.get(id);
-          if (!accum) return undefined;
-          // toolcall_end carries the final parsed arguments; overwrite.
-          if (toolCall.arguments !== undefined) {
-            accum.input = JSON.stringify(toolCall.arguments);
+          // `toolcall_end` carries the authoritative, fully-parsed tool call
+          // at `ev.toolCall`; prefer it over the (possibly mid-stream)
+          // `partial.content[contentIndex]` slice.
+          const toolCall = ev.toolCall;
+          const id = toolCall.id;
+          let accum = buf.toolUses.get(id);
+          if (!accum) {
+            accum = { id, name: toolCall.name ?? "unknown", input: "" };
+            buf.toolUses.set(id, accum);
           }
+          // toolCall.arguments is the final parsed object; stringify it.
+          accum.input = JSON.stringify(toolCall.arguments ?? {});
           if (toolCall.name) accum.name = toolCall.name;
 
           // If a permission-ask handler is configured, surface the tool
@@ -518,7 +528,7 @@ export function handleAgentEvent(
             return {
               needsPermissionAskFor: {
                 toolName: toolCall.name ?? "unknown",
-                input: toolCall.arguments ?? {},
+                input: (toolCall.arguments ?? {}) as Record<string, unknown>,
                 toolCallId: id,
               },
             };
@@ -636,21 +646,6 @@ export function emitControlRequest(
   // Stored on emitter via the entry orchestrator's pendingPermissions map.
   void toolCallId; // referenced for future use
   return requestId;
-}
-
-/**
- * Convenience wrapper to compute the result synthesis once at agent_end.
- */
-export function buildSynthesisFromStats(
-  stats: ReturnType<"object"> | undefined,
-  startedAtMs: number,
-  modelId: string,
-): SynthesizedResultFields {
-  return synthesizeUsageAndCost(
-    stats as unknown as Parameters<typeof synthesizeUsageAndCost>[0],
-    startedAtMs,
-    modelId,
-  );
 }
 
 // Re-export the message/result types so consumers don't have to import

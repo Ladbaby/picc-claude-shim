@@ -145,6 +145,19 @@ function main(): void {
     assertArrayEq(o.unrecognized, ["--no-such-flag", "1"], "unrecognized flags");
   }
 
+  // Invalid --output-format value is ignored (stays undefined).
+  {
+    const o = parseClaudeArgs(["--output-format", "bogus"]);
+    assertEq(o.outputFormat, undefined, "bogus output-format ignored");
+  }
+
+  // A known flag with a missing value lands in unrecognized.
+  {
+    const o = parseClaudeArgs(["--model"]);
+    assertEq(o.model, undefined, "value-less --model ignored");
+    assertArrayEq(o.unrecognized, ["--model"], "value-less known flag -> unrecognized");
+  }
+
   // effortToThinkingLevel
   assertEq(effortToThinkingLevel("max"), "max", "effort max");
   assertEq(effortToThinkingLevel("high"), "high", "effort high");
@@ -153,9 +166,23 @@ function main(): void {
   assertEq(effortToThinkingLevel("minimal"), "minimal", "effort minimal");
   assertEq(effortToThinkingLevel(undefined), "off", "effort undefined -> off");
 
-  // help output is non-empty
-  if (process.env.PI_TEST_SILENT_HELP === undefined) {
-    printClaudeShapedHelp();
+  // help output is non-empty and contains a known flag
+  {
+    const chunks: string[] = [];
+    const orig = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((s: string | Uint8Array) => {
+      chunks.push(String(s));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      printClaudeShapedHelp();
+    } finally {
+      process.stdout.write = orig;
+    }
+    const help = chunks.join("");
+    assertEq(help.length > 0, true, "help output non-empty");
+    assertEq(help.includes("--permission-prompt-tool"), true, "help mentions --permission-prompt-tool");
+    assertEq(help.includes("--output-format"), true, "help mentions --output-format");
   }
 }
 

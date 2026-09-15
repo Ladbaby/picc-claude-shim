@@ -38,6 +38,7 @@ import {
   type SynthesizedModelUsage,
   type SynthesizedResultFields,
 } from "./cost.js";
+import { CLAUDE_CODE_VERSION_BARE } from "./version.js";
 
 // =====================================================================
 // Wire types (Claude Code protocol)
@@ -51,8 +52,21 @@ export interface SDKSystemInit {
   cwd?: string;
   tools?: string[];
   slash_commands?: string[];
-  mcp_servers?: unknown[];
-  permission_mode?: string;
+  mcp_servers?: Array<{ name: string; status: string }>;
+  /**
+   * NOTE: real Claude Code uses `permissionMode` (camelCase) here. The old
+   * field name `permission_mode` (snake_case) was a shim-side typo.
+   */
+  permissionMode?: string;
+  apiKeySource?: string;
+  claude_code_version?: string;
+  output_style?: string;
+  agents?: string[];
+  skills?: string[];
+  plugins?: Array<{ name: string; path: string; source?: string }>;
+  betas?: string[];
+  uuid?: string;
+  parent_tool_use_id?: string | null;
   [k: string]: unknown;
 }
 
@@ -72,8 +86,19 @@ export interface SDKAssistantMessage {
   parent_tool_use_id?: string | null;
   message: {
     role: "assistant";
+    model?: string;
     content: AssistantContentBlock[];
+    /** Anthropic-usage-shaped, mirrored from pi's `usage`. */
+    usage?: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens: number;
+      cache_creation_input_tokens: number;
+    };
+    stop_reason?: string | null;
   };
+  uuid?: string;
+  session_id?: string;
 }
 
 export type AssistantContentBlock =
@@ -107,6 +132,10 @@ export interface SDKResultMessage {
   is_error: boolean;
   session_id: string;
   modelUsage?: Record<string, SynthesizedModelUsage>;
+  stop_reason?: string | null;
+  terminal_reason?: string | null;
+  uuid?: string;
+  parent_tool_use_id?: string | null;
 }
 
 export interface SDKControlRequest {
@@ -116,6 +145,22 @@ export interface SDKControlRequest {
     subtype: "can_use_tool";
     tool_name: string;
     input: Record<string, unknown>;
+    permission_suggestions?: unknown[];
+  };
+}
+
+/**
+ * A `control_response` we emit back to the SDK in answer to one of its
+ * `control_request`s (e.g. `initialize`, `get_usage`). Mirrors Claude Code's
+ * envelope: `{type:"control_response", response:{subtype, request_id, response}}`.
+ */
+export interface SDKControlResponse {
+  type: "control_response";
+  response: {
+    subtype: "success" | "error";
+    request_id: string;
+    response?: unknown;
+    error?: string;
   };
 }
 
@@ -130,6 +175,7 @@ export type SDKMessageOut =
   | SDKUserMessage
   | SDKResultMessage
   | SDKControlRequest
+  | SDKControlResponse
   | SDKControlCancelRequest;
 
 // =====================================================================
@@ -159,6 +205,62 @@ export function createAssistantBuffer(): AssistantBuffer {
     thinkingSegments: [],
     flushed: false,
   };
+}
+
+// =====================================================================
+// Pi -> Anthropic wire-shape helpers
+// =====================================================================
+
+/** Map pi's `Usage` to the Anthropic usage shape t3code reads. */
+export function toAnthropicUsage(
+  usage:
+    | {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+      }
+    | undefined,
+):
+  | {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens: number;
+      cache_creation_input_tokens: number;
+    }
+  | undefined {
+  if (!usage) return undefined;
+  return {
+    input_tokens: usage.input ?? 0,
+    output_tokens: usage.output ?? 0,
+    cache_read_input_tokens: usage.cacheRead ?? 0,
+    cache_creation_input_tokens: usage.cacheWrite ?? 0,
+  };
+}
+
+/** Map pi's `StopReason` to Claude's `stop_reason` values. */
+export function toClaudeStopReason(
+  reason:
+    | "stop"
+    | "length"
+    | "toolUse"
+    | "error"
+    | "aborted"
+    | undefined,
+): string | null {
+  switch (reason) {
+    case "stop":
+      return "end_turn";
+    case "length":
+      return "max_tokens";
+    case "toolUse":
+      return "tool_use";
+    case "error":
+    case "aborted":
+      return "stop_sequence";
+    default:
+      return null;
+  }
 }
 
 /**
@@ -215,6 +317,15 @@ export interface PendingPermission {
 export interface InputContext {
   pendingPermissions: Map<string, PendingPermission>;
   onUserMessage: (text: string) => Promise<void> | void;
+  /**
+   * Handle an incoming `control_request` from the SDK (e.g. `initialize`,
+   * `get_usage`). The callback emits the matching `control_response`.
+   * Optional: when absent, `control_request`s are ignored.
+   */
+  respondControlRequest?: (
+    requestId: string,
+    request: { subtype: string; [k: string]: unknown },
+  ) => void;
 }
 
 /**
@@ -263,6 +374,20 @@ export function handleClaudeInput(
           behavior: "deny",
           message: response.error ?? "permission denied",
         });
+      }
+      return m;
+    }
+
+    case "control_request": {
+      // The SDK sends control_requests (initialize, get_usage, interrupt,
+      // set_model, set_permission_mode, ...). We answer the ones we
+      // understand and ignore the rest with an empty success so the SDK
+      // never hangs waiting.
+      const request = (m as { request?: { subtype?: string; [k: string]: unknown } }).request;
+      const requestId = (m as { request_id?: string }).request_id;
+      const subtype = request?.subtype;
+      if (request && subtype && requestId) {
+        ctx.respondControlRequest?.(requestId, { ...request, subtype });
       }
       return m;
     }
@@ -320,6 +445,11 @@ export interface OutputEmitter {
   startedAtMs: number;
   /** Whether the run has ended (causes translator to stop producing). */
   ended: boolean;
+  /**
+   * The durable session id, set via {@link setSessionId} so per-message
+   * emissions (assistant/result) can stamp `session_id`.
+   */
+  sessionId: string;
 }
 
 export interface EmitterContext extends OutputEmitter {
@@ -363,6 +493,7 @@ export function createTranslatorState(deps: TranslatorDeps): TranslatorState {
     modelId: deps.modelId,
     startedAtMs,
     ended: false,
+    sessionId: "",
     lastFlushedText: "",
     pendingSynthesis: undefined,
   };
@@ -386,6 +517,7 @@ export function emitSystemInit(
 ): void {
   if (state.initEmitted) return;
   state.initEmitted = true;
+  state.emitter.sessionId = sessionId;
   const msg: SDKSystemInit = {
     type: "system",
     subtype: "init",
@@ -394,7 +526,17 @@ export function emitSystemInit(
     cwd: deps.cwd,
     tools: deps.toolsAvailable(),
     slash_commands: deps.slashCommandsAvailable?.() ?? [],
-    permission_mode: deps.permissionMode ?? "default",
+    mcp_servers: [],
+    permissionMode: deps.permissionMode ?? "default",
+    apiKeySource: "user",
+    claude_code_version: CLAUDE_CODE_VERSION_BARE,
+    output_style: "default",
+    agents: [],
+    skills: [],
+    plugins: [],
+    betas: [],
+    uuid: randomUUID(),
+    parent_tool_use_id: null,
   };
   state.emitter.emit(msg);
 }
@@ -552,11 +694,21 @@ export function handleAgentEvent(
       if (content.length === 0) {
         content.push({ type: "text", text: "" });
       }
-      const assistant: SDKAssistantMessage = {
+      const assistant = message as unknown as AssistantMessage;
+      const assistantMsg: SDKAssistantMessage = {
         type: "assistant",
-        message: { role: "assistant", content },
+        parent_tool_use_id: null,
+        message: {
+          role: "assistant",
+          model: assistant.model,
+          content,
+          usage: toAnthropicUsage(assistant.usage),
+          stop_reason: toClaudeStopReason(assistant.stopReason),
+        },
+        uuid: randomUUID(),
+        session_id: state.emitter.sessionId,
       };
-      state.emitter.emit(assistant);
+      state.emitter.emit(assistantMsg);
       state.emitter.lastFlushedText = content
         .filter((b) => b.type === "text")
         .map((b) => (b as { text: string }).text)
@@ -614,6 +766,10 @@ export function emitResult(
     is_error: isError,
     session_id: sessionId,
     modelUsage: synthesis.modelUsage as unknown as SDKResultMessage["modelUsage"],
+    stop_reason: errorMaxTurns ? "max_turns" : isError ? "stop_sequence" : "end_turn",
+    terminal_reason: null,
+    uuid: randomUUID(),
+    parent_tool_use_id: null,
   };
   state.emitter.emit(result);
 }
@@ -646,6 +802,96 @@ export function emitControlRequest(
   // Stored on emitter via the entry orchestrator's pendingPermissions map.
   void toolCallId; // referenced for future use
   return requestId;
+}
+
+/**
+ * Build and emit a `control_response` answering an incoming `control_request`.
+ *
+ * Handles the subtypes the Claude Agent SDK actually sends and that a
+ * `claude`-impersonator is expected to answer:
+ *   - `initialize`  → account/models/commands/output_styles (what
+ *     `q.initializationResult()` awaits)
+ *   - `get_usage`   → rate-limit windows (what `usage_EXPERIMENTAL_…()` awaits)
+ *   - everything else → a bare `success` with an empty payload, so the SDK
+ *     never hangs waiting on a response it won't retry.
+ */
+export function respondControlRequest(
+  state: TranslatorState,
+  requestId: string,
+  request: { subtype: string; [k: string]: unknown },
+): void {
+  const response: unknown = buildControlResponsePayload(request);
+  const msg: SDKControlResponse = {
+    type: "control_response",
+    response: { subtype: "success", request_id: requestId, response },
+  };
+  state.emitter.emit(msg);
+}
+
+/**
+ * Build the `response` payload for a `control_request`. Pure (no side
+ * effects) so it can be unit-tested directly.
+ */
+export function buildControlResponsePayload(
+  request: { subtype: string; [k: string]: unknown },
+): unknown {
+  switch (request.subtype) {
+    case "initialize": {
+      const now = Date.now();
+      const in5h = Math.floor(now / 1000) + 5 * 3600;
+      const in7d = Math.floor(now / 1000) + 7 * 24 * 3600;
+      return {
+        commands: [],
+        agents: [],
+        output_style: "default",
+        available_output_styles: ["default", "Explanatory", "Learning"],
+        models: [
+          {
+            value: "claude-sonnet",
+            displayName: "Claude Sonnet",
+            description: "General-purpose coding model.",
+            supportsEffort: true,
+            supportedEffortLevels: ["low", "medium", "high", "max"],
+            supportsAdaptiveThinking: true,
+            supportsFastMode: false,
+            supportsAutoMode: false,
+          },
+        ],
+        account: {
+          email: null,
+          organization: null,
+          subscriptionType: "api",
+          tokenSource: "apiKey",
+          apiKeySource: "user",
+          apiProvider: "firstParty",
+        },
+        pid: process.pid,
+        fast_mode_state: "off",
+      };
+    }
+    case "get_usage":
+    case "usage": {
+      const now = Date.now();
+      const in5h = Math.floor(now / 1000) + 5 * 3600;
+      const in7d = Math.floor(now / 1000) + 7 * 24 * 3600;
+      return {
+        session: {},
+        subscription_type: "api",
+        rate_limits_available: true,
+        rate_limits: {
+          five_hour: { utilization: 0, resets_at: in5h },
+          seven_day: { utilization: 0, resets_at: in7d },
+          model_scoped: [],
+        },
+        behaviors: null,
+      };
+    }
+    default:
+      // Unknown / unsupported control_request subtypes: empty success so the
+      // SDK does not block. The SDK ignores a null response for subtypes it
+      // does not expect.
+      return {};
+  }
 }
 
 // Re-export the message/result types so consumers don't have to import

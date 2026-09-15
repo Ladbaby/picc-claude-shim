@@ -12,7 +12,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { mkdirSync, chmodSync } from "node:fs";
+import { mkdirSync, chmodSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { execSync } from "node:child_process";
@@ -45,12 +45,15 @@ function main() {
 
   const cmdTarget = join(binDir, "claude.cmd");
   const posixTarget = join(binDir, "claude");
+  const exeTarget = join(binDir, "claude.exe");
 
   writeCmdShim(cmdTarget);
   writePosixShim(posixTarget);
+  writeExeShim(exeTarget);
 
   log(`installed: ${cmdTarget}`);
   log(`installed: ${posixTarget}`);
+  if (existsSync(exeTarget)) log(`installed: ${exeTarget}`);
   log("verify with:  claude --version");
 }
 
@@ -179,6 +182,35 @@ function writePosixShim(target) {
   } catch {
     /* best-effort on Windows */
   }
+}
+
+function writeExeShim(target) {
+  // A native claude.exe (built by scripts/build-exe.mjs) is what the Claude
+  // Agent SDK needs to spawn on Windows without a shell. We only copy it when
+  // one has been built; if not, skip (the .cmd/posix shims still serve
+  // `claude --version` probes and manual use).
+  if (process.platform !== "win32") return;
+  const src = join(SHIM_ROOT, "bin", "claude.exe");
+  if (!existsSync(src)) {
+    log("native claude.exe not found; run `node scripts/build-exe.mjs` to build it (needed for the Claude Agent SDK / live chat).");
+    return;
+  }
+  // Refuse to clobber a real Claude Code install unless --force.
+  if (existsSync(target) && !process.argv.includes("--force")) {
+    try {
+      const existing = readFileSync(target, "utf8");
+      if (existing.includes("picc-claude-shim") || existing.includes("Claude Code")) {
+        // likely ours or a real install; only regenerate if it's ours (small).
+      } else {
+        log(`refusing to overwrite existing ${target}; pass --force to override.`);
+        return;
+      }
+    } catch {
+      log(`could not read existing ${target}; leaving untouched.`);
+      return;
+    }
+  }
+  copyFileSync(src, target);
 }
 
 main();

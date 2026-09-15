@@ -48,6 +48,12 @@ export interface ClaudeShimOptions {
   fallbackModel: string | undefined;
   maxTurns: number | undefined;
   printPrompt: string | undefined;
+  /** Set when `--dangerously-skip-permissions` is present. */
+  dangerouslySkipPermissions: boolean;
+  /** App-provided session id (the SDK's `sessionId` option). */
+  sessionId: string | undefined;
+  /** `--json-schema <json>` payload for structured-output mode. */
+  jsonSchema: string | undefined;
 
   // Bookkeeping
   help: boolean;
@@ -76,9 +82,35 @@ const KNOWN_FLAGS = new Set([
   "--print",
   "--help",
   "--version",
+  // Flags sent by the Claude Agent SDK / t3code that we parse.
+  "--session-id",
+  "--setting-sources",
+  "--mcp-config",
+  "--tools",
+  "--json-schema",
 ]);
 
-const SHORT_FLAGS = new Set(["-v", "-h", "-p"]);
+const SHORT_FLAGS = new Set(["-v", "-V", "-h", "-p"]);
+
+/**
+ * Flags the SDK / t3code send that take NO value. Accepted and recorded
+ * (where meaningful) but never consume a following token.
+ */
+const BOOLEAN_FLAGS = new Set([
+  "--dangerously-skip-permissions",
+  "--include-partial-messages",
+  "--strict-mcp-config",
+  "--disable-slash-commands",
+  "--replay-user-messages",
+]);
+
+/** Flags we accept but do nothing with (accepted to avoid `unrecognized`). */
+const IGNORED_FLAGS = new Set([
+  "--strict-mcp-config",
+  "--disable-slash-commands",
+  "--include-partial-messages",
+  "--replay-user-messages",
+]);
 
 /**
  * Parse Claude-Code-style argv into structured options. The output mimics
@@ -106,6 +138,9 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
     fallbackModel: undefined,
     maxTurns: undefined,
     printPrompt: undefined,
+    dangerouslySkipPermissions: false,
+    sessionId: undefined,
+    jsonSchema: undefined,
     help: false,
     version: false,
     unrecognized: [],
@@ -128,8 +163,21 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
       i++;
       continue;
     }
-    if (arg === "--version" || arg === "-v") {
+    if (arg === "--version" || arg === "-v" || arg === "-V") {
       opts.version = true;
+      i++;
+      continue;
+    }
+
+    // Boolean flags sent by the SDK: no value follows.
+    if (BOOLEAN_FLAGS.has(arg)) {
+      if (arg === "--dangerously-skip-permissions") {
+        opts.dangerouslySkipPermissions = true;
+        // Full-access: the SDK sends this (instead of --permission-mode) to
+        // mean bypassPermissions.
+        opts.permissionMode = "bypassPermissions";
+      }
+      // The rest are intentionally ignored.
       i++;
       continue;
     }
@@ -266,6 +314,17 @@ function applyFlag(opts: ClaudeShimOptions, flag: string, raw: string): void {
     case "--max-turns":
       opts.maxTurns = parseIntOrUndefined(raw);
       break;
+    case "--session-id":
+      opts.sessionId = raw;
+      break;
+    case "--json-schema":
+      opts.jsonSchema = raw;
+      break;
+    // Accepted but unused (SDK/t3code send these; we honor none of them).
+    case "--setting-sources":
+    case "--mcp-config":
+    case "--tools":
+      break;
     default:
       opts.unrecognized.push(flag, raw);
       break;
@@ -354,12 +413,18 @@ export function printClaudeShapedHelp(): void {
     "  --effort <level>               max|high|medium|low|minimal.",
     "  --fallback-model <id>          Fallback model on primary failure.",
     "  --max-turns <n>                Maximum agentic turns.",
+    "  --session-id <id>              Use a specific session id for this run.",
+    "  --dangerously-skip-permissions Skip tool permission prompts (bypass mode).",
+    "  --include-partial-messages     Stream partial message deltas.",
+    "  --setting-sources <srcs>       Accepted; unused.",
+    "  --mcp-config <path>            Accepted; unused.",
+    "  --tools <list>                 Accepted; unused.",
+    "  --json-schema <json>           Structured-output schema.",
     "  -h, --help                     Show this help.",
-    "  -v, --version                  Print version.",
+    "  -v, -V, --version              Print version.",
     "",
     "Drop-in replacement for Claude Code's CLI backed by pi.",
-    "Local (interactive) mode is not supported; this binary speaks",
-    "the stream-json protocol that the hapi integration uses.",
+    "Speaks the stream-json protocol used by the Claude Agent SDK.",
   ].join("\n");
   process.stdout.write(text + "\n");
 }

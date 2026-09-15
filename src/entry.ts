@@ -45,13 +45,15 @@ import {
   emitSystemInit,
   handleAgentEvent as translateAgentEvent,
   handleClaudeInput,
+  respondControlRequest,
   type SDKMessageOut,
 } from "./translator.js";
 import { fromClaudeToolName } from "./tool-names.js";
 import { synthesizeUsageAndCost } from "./cost.js";
 import { createInterface } from "node:readline";
+import { CLAUDE_CODE_VERSION_LINE } from "./version.js";
 
-const PI_VERSION = "0.0.1-pi-claude-shim";
+const PI_VERSION = CLAUDE_CODE_VERSION_LINE;
 
 function logStartupBanner(opts: ClaudeShimOptions, mode: string): void {
   process.stderr.write(`pi-claude-shim ${PI_VERSION} mode=${mode}\n`);
@@ -66,16 +68,18 @@ function logStartupBanner(opts: ClaudeShimOptions, mode: string): void {
  * Decide whether the permission gate is open — i.e. whether the shim emits
  * `control_request` for tool calls and waits for a `control_response`.
  *
- * The gate is open only when the parent explicitly asks for stdio permission
- * prompts (`--permission-prompt-tool stdio`) AND the mode is not
- * `bypassPermissions`. Exported as a pure function so it can be unit-tested
+ * The Claude Agent SDK drives permissions through an in-process `canUseTool`
+ * callback (not `--permission-prompt-tool stdio`), so the gate is open for
+ * any permission mode that is *not* `bypassPermissions`. `bypassPermissions`
+ * (the SDK's full-access mode, set via `--dangerously-skip-permissions`) skips
+ * the round-trip entirely. Exported as a pure function so it can be unit-tested
  * without spinning up a session.
  */
 export function computeGateOpen(
   permissionPromptTool: "stdio" | undefined,
   permissionMode: ClaudePermissionMode | undefined,
 ): boolean {
-  return permissionPromptTool === "stdio" && permissionMode !== "bypassPermissions";
+  return permissionMode !== "bypassPermissions";
 }
 
 function resolveCwd(): string {
@@ -152,6 +156,12 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   const { session } = buildResult.value;
   const modelId = describeModelId(session);
 
+  // The wire-level session id. If the SDK asked us to use a specific
+  // session id (`--session-id`, from the `sessionId` query option), we must
+  // echo that exact value in `init.session_id` and every message so t3code
+  // can correlate it. Otherwise use pi's own id.
+  const wireSessionId = opts.sessionId ?? session.sessionId;
+
   // 1. The hapi-compatible session JSONL must exist before any
   //    `system/init` line is emitted.
   const sessionFile = ensureHapiCompatibleSessionFile({
@@ -160,11 +170,8 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     modelId,
   });
 
-  // 2. Permission gate wiring: the gate is open only when the parent
-  //    explicitly asks for stdio permission prompts AND the mode is not
-  //    bypassPermissions. hapi sends `--permission-prompt-tool stdio` to
-  //    request control_request round-trips; without that flag we never
-  //    emit control_request, even in a non-bypass permission mode.
+  // 2. Permission gate: open for any non-bypass mode (the SDK drives
+  //    permissions via an in-process canUseTool callback).
   const gateOpen = computeGateOpen(opts.permissionPromptTool, opts.permissionMode);
 
   // 3. Build a stdio writer + translator state.
@@ -253,7 +260,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   });
 
   // 6. Emit system/init now that we have the session id.
-  emitSystemInit(state, session.sessionId, {
+  emitSystemInit(state, wireSessionId, {
     cwd,
     modelId,
     toolsAvailable: () => listActiveToolsLowercase(session),
@@ -271,6 +278,15 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
       try {
         handleClaudeInput(line, {
           pendingPermissions: pending,
+          respondControlRequest: (requestId: string, request: { subtype: string; [k: string]: unknown }) => {
+            try {
+              respondControlRequest(state, requestId, request);
+            } catch (e) {
+              process.stderr.write(
+                `pi-claude-shim: control_request ${request.subtype} failed: ${(e as Error).message}\n`,
+              );
+            }
+          },
           onUserMessage: (text: string) => {
             appendSessionEntry(sessionFile, {
               kind: "user",
@@ -354,7 +370,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     state.emitter.startedAtMs,
     modelId,
   );
-  emitResult(state, synthesis, session.sessionId, runErrored, false);
+  emitResult(state, synthesis, wireSessionId, runErrored, false);
 
   // 11. Cleanup.
   rl.close();

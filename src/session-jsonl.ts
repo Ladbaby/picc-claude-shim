@@ -23,6 +23,7 @@ import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
+import { CLAUDE_CODE_VERSION_BARE } from "./version.js";
 
 export interface SessionFileOptions {
   /** hapi spawns claude in this directory; we mimic the path it expects. */

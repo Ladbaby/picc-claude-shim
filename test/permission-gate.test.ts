@@ -1,8 +1,8 @@
 /**
  * Unit test for the permission-gate decision.
  *
- * The gate is open only when the parent asks for stdio permission prompts
- * AND the mode is not bypassPermissions.
+ * The Claude Agent SDK drives permissions through an in-process `canUseTool`
+ * callback, so the gate is open for any mode that is NOT `bypassPermissions`.
  */
 
 import { computeGateOpen } from "../src/entry.js";
@@ -18,15 +18,15 @@ function assertEq(actual: unknown, expected: unknown, label: string): void {
   process.stdout.write(`ok ${label}\n`);
 }
 
-// stdio requested + non-bypass mode -> gate open.
+// Any non-bypass mode -> gate open (the SDK's canUseTool callback is invoked).
 assertEq(computeGateOpen("stdio", "default"), true, "stdio + default -> open");
 assertEq(computeGateOpen("stdio", "acceptEdits"), true, "stdio + acceptEdits -> open");
 assertEq(computeGateOpen("stdio", "plan"), true, "stdio + plan -> open");
+assertEq(computeGateOpen("stdio", "auto"), true, "stdio + auto -> open");
+assertEq(computeGateOpen(undefined, "default"), true, "no stdio + default -> open");
+assertEq(computeGateOpen(undefined, "acceptEdits"), true, "no stdio + acceptEdits -> open");
+assertEq(computeGateOpen(undefined, undefined), true, "no stdio + no mode -> open");
 
-// stdio requested + bypass -> gate closed.
+// bypassPermissions -> gate closed (full-access; no permission round-trip).
 assertEq(computeGateOpen("stdio", "bypassPermissions"), false, "stdio + bypass -> closed");
-
-// No stdio requested -> gate closed even for non-bypass mode.
-assertEq(computeGateOpen(undefined, "default"), false, "no stdio + default -> closed");
-assertEq(computeGateOpen(undefined, "acceptEdits"), false, "no stdio + acceptEdits -> closed");
-assertEq(computeGateOpen(undefined, undefined), false, "no stdio + no mode -> closed");
+assertEq(computeGateOpen(undefined, "bypassPermissions"), false, "no stdio + bypass -> closed");

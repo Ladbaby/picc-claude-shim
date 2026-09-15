@@ -15,6 +15,10 @@ import {
   emitSystemInit,
   flushAssistantBuffer,
   handleAgentEvent,
+  handleClaudeInput,
+  buildControlResponsePayload,
+  toClaudeStopReason,
+  toAnthropicUsage,
   type SDKMessageOut,
 } from "../src/translator.js";
 import { synthesizeUsageAndCost } from "../src/cost.js";
@@ -75,6 +79,32 @@ assertEq(init.type, "system", "init type");
 assertEq((init as { subtype: string }).subtype, "init", "init subtype");
 assertEq((init as { session_id: string }).session_id, "session-1", "init session_id");
 assertEq(Array.isArray((init as { tools: unknown[] }).tools), true, "init tools array");
+// New Phase-2a fields.
+assertEq(
+  (init as { permissionMode?: string }).permissionMode,
+  "default",
+  "init permissionMode camelCase",
+);
+assertEq(
+  (init as { claude_code_version?: string }).claude_code_version,
+  "1.0.37",
+  "init claude_code_version",
+);
+assertEq(
+  (init as { apiKeySource?: string }).apiKeySource,
+  "user",
+  "init apiKeySource",
+);
+assertEq(
+  (init as { model?: string }).model,
+  "claude-sonnet",
+  "init model",
+);
+assertEq(
+  typeof (init as { uuid?: string }).uuid,
+  "string",
+  "init uuid present",
+);
 
 // 2. Idempotency: a second emitSystemInit is a no-op.
 col.lines = [];
@@ -118,6 +148,9 @@ handleAgentEvent(state, {
   message: {
     role: "assistant",
     content: [{ type: "text", text: "hello world" }],
+    model: "claude-sonnet",
+    usage: { input: 7, output: 3, cacheRead: 1, cacheWrite: 0 },
+    stopReason: "toolUse",
     timestamp: ts,
   } as never,
 } as never, {} as never);
@@ -127,6 +160,33 @@ assertEq(
   JSON.stringify((flushed as { message: { content: unknown[] } }).message.content),
   JSON.stringify([{ type: "text", text: "hello world" }]),
   "assistant content",
+);
+assertEq(
+  (flushed as { message: { model?: string } }).message.model,
+  "claude-sonnet",
+  "assistant model",
+);
+assertEq(
+  (flushed as { message: { stop_reason?: string } }).message.stop_reason,
+  "tool_use",
+  "assistant stop_reason mapped",
+);
+assertEq(
+  JSON.stringify(
+    (flushed as { message: { usage?: unknown } }).message.usage,
+  ),
+  JSON.stringify({ input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 }),
+  "assistant usage anthropic-shaped",
+);
+assertEq(
+  typeof (flushed as { uuid?: string }).uuid,
+  "string",
+  "assistant uuid present",
+);
+assertEq(
+  (flushed as { session_id?: string }).session_id,
+  "session-1",
+  "assistant session_id",
 );
 
 // 4. Buffer helper: prebuilt tool_use + text + thinking flushes all three.
@@ -168,6 +228,16 @@ assertEq(
   true,
   "result modelUsage present",
 );
+assertEq(
+  (result as { stop_reason?: string | null }).stop_reason,
+  "end_turn",
+  "result stop_reason on success",
+);
+assertEq(
+  typeof (result as { uuid?: string }).uuid,
+  "string",
+  "result uuid present",
+);
 
 // 7. Error result: isError flips subtype to error_during_execution.
 col.lines = [];
@@ -177,6 +247,11 @@ assertEq(
   (errResult as { subtype: string }).subtype,
   "error_during_execution",
   "error result subtype",
+);
+assertEq(
+  (errResult as { stop_reason?: string | null }).stop_reason,
+  "stop_sequence",
+  "error result stop_reason",
 );
 
 // 8. control_request output shape.
@@ -195,4 +270,76 @@ assertEq(
   assertEq(req.request.tool_name, "Bash", "control_request tool_name");
   assertEq(JSON.stringify(req.request.input), JSON.stringify({ command: "ls" }), "control_request input");
   assertEq(col.lines.length > before, true, "control_request emitted a line");
+}
+
+// 9. buildControlResponsePayload: the shapes the Claude Agent SDK awaits.
+{
+  const initPayload = buildControlResponsePayload({ subtype: "initialize" }) as Record<string, unknown>;
+  assertEq(
+    Array.isArray(initPayload.models),
+    true,
+    "initialize response has models array",
+  );
+  assertEq(
+    Array.isArray(initPayload.available_output_styles),
+    true,
+    "initialize response has available_output_styles",
+  );
+  assertEq(
+    "account" in initPayload,
+    true,
+    "initialize response has account",
+  );
+  assertEq(
+    typeof initPayload.pid === "number",
+    true,
+    "initialize response has numeric pid",
+  );
+
+  const usagePayload = buildControlResponsePayload({ subtype: "get_usage" }) as {
+    rate_limits_available: boolean;
+    rate_limits: {
+      five_hour: { utilization: number; resets_at: number };
+      seven_day: { utilization: number; resets_at: number };
+    };
+  };
+  assertEq(usagePayload.rate_limits_available, true, "usage response rate_limits_available");
+  assertEq(typeof usagePayload.rate_limits.five_hour.resets_at === "number", true, "usage five_hour resets_at");
+  assertEq(typeof usagePayload.rate_limits.seven_day.resets_at === "number", true, "usage seven_day resets_at");
+
+  // Unknown subtypes resolve to an empty success payload (never throw).
+  assertEq(JSON.stringify(buildControlResponsePayload({ subtype: "set_model" })), "{}", "unknown subtype -> {}");
+}
+
+// 10. toClaudeStopReason / toAnthropicUsage helpers.
+assertEq(toClaudeStopReason("stop"), "end_turn", "stopReason stop -> end_turn");
+assertEq(toClaudeStopReason("toolUse"), "tool_use", "stopReason toolUse -> tool_use");
+assertEq(toClaudeStopReason("length"), "max_tokens", "stopReason length -> max_tokens");
+assertEq(toClaudeStopReason(undefined), null, "stopReason undefined -> null");
+assertEq(
+  JSON.stringify(toAnthropicUsage({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 })),
+  JSON.stringify({ input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }),
+  "usage mapped",
+);
+assertEq(toAnthropicUsage(undefined) === undefined, true, "usage undefined -> undefined");
+
+// 11. handleClaudeInput routes an incoming control_request to the responder.
+{
+  const seen: { id: string; subtype: string }[] = [];
+  const ctx = {
+    pendingPermissions: new Map<string, never>(),
+    onUserMessage: () => undefined,
+    respondControlRequest: (id: string, req: { subtype: string }) => {
+      seen.push({ id, subtype: req.subtype });
+    },
+  };
+  handleClaudeInput(
+    JSON.stringify({ type: "control_request", request_id: "cr_1", request: { subtype: "initialize" } }),
+    ctx,
+  );
+  assertEq(
+    seen.length === 1 && seen[0]!.id === "cr_1" && seen[0]!.subtype === "initialize",
+    true,
+    "control_request routed to responder",
+  );
 }

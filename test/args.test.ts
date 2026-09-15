@@ -48,9 +48,10 @@ function main(): void {
     assertEq(o.verbose, false, "empty argv verbose");
   }
 
-  // --version / -v
+  // --version / -v / -V
   assertEq(parseClaudeArgs(["-v"]).version, true, "-v sets version");
   assertEq(parseClaudeArgs(["--version"]).version, true, "--version sets version");
+  assertEq(parseClaudeArgs(["-V"]).version, true, "-V sets version");
 
   // --help / -h
   assertEq(parseClaudeArgs(["-h"]).help, true, "-h sets help");
@@ -144,6 +145,52 @@ function main(): void {
     const o = parseClaudeArgs(["--no-such-flag", "1"]);
     assertArrayEq(o.unrecognized, ["--no-such-flag", "1"], "unrecognized flags");
   }
+
+  // --- Claude Agent SDK / t3code flags ---
+
+  // --session-id
+  assertEq(parseClaudeArgs(["--session-id", "sess-123"]).sessionId, "sess-123", "session-id");
+
+  // --dangerously-skip-permissions -> bypassPermissions
+  {
+    const o = parseClaudeArgs(["--dangerously-skip-permissions"]);
+    assertEq(o.dangerouslySkipPermissions, true, "skip-permissions flag");
+    assertEq(o.permissionMode, "bypassPermissions", "skip-permissions -> bypassPermissions");
+  }
+
+  // Boolean flag: accepted, no value consumed
+  {
+    const o = parseClaudeArgs([
+      "--include-partial-messages",
+      "--model", "opus",
+    ]);
+    assertEq(o.model, "opus", "include-partial-messages does not eat --model");
+    assertArrayEq(o.unrecognized, [], "bool flag not unrecognized");
+  }
+
+  // --json-schema
+  assertEq(
+    parseClaudeArgs(["--json-schema", '{"type":"object"}']).jsonSchema,
+    '{"type":"object"}',
+    "json-schema",
+  );
+
+  // Ignored value flags (accepted, not unrecognized)
+  {
+    const o = parseClaudeArgs([
+      "--setting-sources", "user,project",
+      "--mcp-config", "x.json",
+      "--tools", "default",
+    ]);
+    assertArrayEq(o.unrecognized, [], "setting-sources/mcp-config/tools ignored");
+  }
+
+  // Inline `=` on session-id
+  assertEq(
+    parseClaudeArgs(["--session-id=sess=eq"]).sessionId,
+    "sess=eq",
+    "session-id= inline with = in value",
+  );
 
   // Invalid --output-format value is ignored (stays undefined).
   {

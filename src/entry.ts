@@ -50,6 +50,7 @@ import {
 } from "./translator.js";
 import { fromClaudeToolName } from "./tool-names.js";
 import { synthesizeUsageAndCost } from "./cost.js";
+import { extractStructuredOutput } from "./structured-output.js";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { CLAUDE_CODE_VERSION_LINE } from "./version.js";
@@ -98,16 +99,19 @@ export async function runClaudeShim(argv: readonly string[]): Promise<number> {
     return 0;
   }
 
-  const isPrint = opts.printPrompt !== undefined;
+  const isPrint = opts.printMode || opts.printPrompt !== undefined;
   const isStreamJson = opts.outputFormat === "stream-json";
   const isJson = opts.outputFormat === "json";
 
-  if (isPrint) {
-    logStartupBanner(opts, "print");
+  // Banner precedence mirrors dispatch: json > stream-json > print. A bare
+  // `-p` sets printMode, so json must win when both are present (t3code's
+  // `claude -p --output-format json` text-gen path).
+  if (isJson) {
+    logStartupBanner(opts, "json");
   } else if (isStreamJson) {
     logStartupBanner(opts, "stream-json");
-  } else if (isJson) {
-    logStartupBanner(opts, "json");
+  } else if (isPrint) {
+    logStartupBanner(opts, "print");
   } else {
     logStartupBanner(opts, "unsupported");
     process.stderr.write(
@@ -118,8 +122,83 @@ export async function runClaudeShim(argv: readonly string[]): Promise<number> {
 
   const cwd = resolveCwd();
 
+  if (isJson) return runJsonMode(opts, cwd);
   if (isPrint) return runPrintMode(opts, cwd);
   return runStreamJson(opts, cwd);
+}
+
+// =====================================================================
+// --output-format json mode: one-shot single-JSON-object output.
+//
+// Used by t3code's text generation (`claude -p --output-format json
+// --json-schema <schema>`), where the prompt arrives on stdin and stdout
+// must be a single JSON document. With `--json-schema`, we emit
+// `{"structured_output": <value>}` (Shape A of t3code's parser). Without a
+// schema we emit a Claude `result` message for callers that read `result`.
+// =====================================================================
+
+/** Read the entire stdin as UTF-8 text. */
+async function readStdinText(): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  process.stdin.setEncoding("utf8");
+  let data = "";
+  for await (const chunk of process.stdin) data += chunk as string;
+  return data;
+}
+
+async function runJsonMode(opts: ClaudeShimOptions, cwd: string): Promise<number> {
+  // Prompt: inline `--print` value if present, otherwise read stdin
+  // (t3code's text-gen sends the prompt on stdin with a bare `-p`).
+  const prompt = (opts.printPrompt ?? (await readStdinText())).trim();
+
+  if (prompt.length === 0) {
+    process.stderr.write("pi-claude-shim: empty prompt for --output-format json\n");
+    return 1;
+  }
+
+  const buildResult = await buildPiSession(opts, cwd, "builtin");
+  if (!buildResult.ok) return writeBuildError(buildResult.error);
+
+  const { session } = buildResult.value;
+  let finalText = "";
+  session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      finalText += event.assistantMessageEvent.delta;
+    }
+  });
+
+  let exitCode = 0;
+  try {
+    await session.prompt(prompt);
+    await waitForAgentSettle(session);
+  } catch (e) {
+    process.stderr.write(`pi-claude-shim: session failed: ${(e as Error).message}\n`);
+    exitCode = 1;
+  }
+
+  const sessionId = session.sessionId;
+  const startedAtMs = Date.now();
+
+  if (opts.jsonSchema !== undefined) {
+    const structured = extractStructuredOutput(finalText, opts.jsonSchema);
+    process.stdout.write(JSON.stringify({ structured_output: structured }) + "\n");
+  } else {
+    // Plain json: a single Claude `result` message (the shape the CLI's
+    // non-streaming `--output-format json` produces).
+    const result = {
+      type: "result",
+      subtype: "success",
+      result: finalText,
+      session_id: sessionId,
+      num_turns: 1,
+      is_error: exitCode !== 0,
+      duration_ms: Date.now() - startedAtMs,
+    };
+    process.stdout.write(JSON.stringify(result) + "\n");
+  }
+
+  session.dispose();
+  return exitCode;
 }
 
 // =====================================================================
@@ -127,7 +206,7 @@ export async function runClaudeShim(argv: readonly string[]): Promise<number> {
 // =====================================================================
 
 async function runPrintMode(opts: ClaudeShimOptions, cwd: string): Promise<number> {
-  const buildResult = await buildPiSession(opts, cwd);
+  const buildResult = await buildPiSession(opts, cwd, undefined);
   if (!buildResult.ok) return writeBuildError(buildResult.error);
 
   const { session } = buildResult.value;
@@ -138,7 +217,9 @@ async function runPrintMode(opts: ClaudeShimOptions, cwd: string): Promise<numbe
       process.stdout.write(event.assistantMessageEvent.delta);
     }
   });
-  await session.prompt(opts.printPrompt ?? "");
+  // Bare `-p` (no inline value) delivers the prompt on stdin.
+  const prompt = opts.printPrompt ?? (await readStdinText());
+  await session.prompt(prompt.trim());
   await waitForAgentSettle(session);
   process.stdout.write("\n");
   session.dispose();
@@ -272,7 +353,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   const ensureSession = (): Promise<void> => {
     if (!buildPromise) {
       buildPromise = (async () => {
-        const buildResult = await buildPiSession(opts, cwd);
+        const buildResult = await buildPiSession(opts, cwd, undefined);
         if (!buildResult.ok) throw new Error(buildResult.error);
         const s = buildResult.value.session;
         session = s;
@@ -418,6 +499,7 @@ interface SessionRuntime {
 async function buildPiSession(
   opts: ClaudeShimOptions,
   cwd: string,
+  noTools: "all" | "builtin" | undefined,
 ): Promise<Result<SessionRuntime>> {
   let settingsManager;
   try {
@@ -489,6 +571,7 @@ async function buildPiSession(
       modelRuntime,
       thinkingLevel: effortToThinkingLevel(opts.effort),
     };
+    if (noTools) createOpts.noTools = noTools;
     if (allowed.length > 0) createOpts.tools = allowed;
     if (disallowed.length > 0) createOpts.excludeTools = disallowed;
 

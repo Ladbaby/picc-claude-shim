@@ -48,6 +48,14 @@ export interface ClaudeShimOptions {
   fallbackModel: string | undefined;
   maxTurns: number | undefined;
   printPrompt: string | undefined;
+  /**
+   * Set when print mode is active: either `--print <prompt>` (value form,
+   * hapi's pre-joined shape) or a bare `-p` (t3code's text-generation shape,
+   * where the prompt is delivered on stdin). `printPrompt` is the inline
+   * value when present; when only `printMode` is set, read the prompt from
+   * stdin.
+   */
+  printMode: boolean;
   /** Set when `--dangerously-skip-permissions` is present. */
   dangerouslySkipPermissions: boolean;
   /**
@@ -142,6 +150,7 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
     fallbackModel: undefined,
     maxTurns: undefined,
     printPrompt: undefined,
+    printMode: false,
     dangerouslySkipPermissions: false,
     includePartialMessages: false,
     sessionId: undefined,
@@ -189,23 +198,27 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
       continue;
     }
 
-    // -p / --print: may be `--print <prompt>` or `-p <prompt>` or
-    // `--print=<prompt>` (rare). hapi's query.ts passes
-    // `--print "<prompt>"` only after pre-joining, so two args (or one
-    // `--print=...`) is the expected shape.
+    // -p / --print: two shapes coexist in the wild.
+    //   * value form: `--print "say hi"` / `-p "say hi"` / `--print=x` —
+    //     hapi's query.ts pre-joins the prompt and passes it as the value.
+    //   * bare form:  `-p` alone — t3code's text-generation path (and the
+    //     documented `claude -p`) delivers the prompt on stdin, with further
+    //     flags following (e.g. `-p --output-format json --json-schema ...`).
+    //     If the next token looks like a flag, do NOT consume it; treat `-p`
+    //     as a boolean and read the prompt from stdin instead.
     if (arg === "-p" || arg === "--print") {
+      opts.printMode = true;
       const next = argv[i + 1];
-      if (next === undefined) {
-        // hapi's --print always carries a value; treat bare `-p` as no-op
-        // for safety.
-        i++;
-        continue;
+      if (next !== undefined && !isFlagLike(next)) {
+        opts.printPrompt = next;
+        i += 2;
+      } else {
+        i += 1;
       }
-      opts.printPrompt = next;
-      i += 2;
       continue;
     }
     if (arg.startsWith("--print=")) {
+      opts.printMode = true;
       opts.printPrompt = arg.slice("--print=".length);
       i++;
       continue;
@@ -336,6 +349,16 @@ function applyFlag(opts: ClaudeShimOptions, flag: string, raw: string): void {
       opts.unrecognized.push(flag, raw);
       break;
   }
+}
+
+/**
+ * Heuristic: does this token look like a CLI flag? Used to decide whether a
+ * bare `-p`/`--print` should treat its next token as the prompt value or as
+ * the start of a following flag. Mirrors common CLI convention: anything
+ * starting with `-` (except a bare `-`, which denotes stdin) is a flag.
+ */
+function isFlagLike(token: string): boolean {
+  return token.startsWith("-") && token.length > 1;
 }
 
 function splitCsv(s: string): string[] {

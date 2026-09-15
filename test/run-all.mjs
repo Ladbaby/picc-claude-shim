@@ -20,6 +20,7 @@ const tests = [
   "permission-gate.test.ts",
   "translator.test.ts",
   "translator-out.test.ts",
+  "structured-output.test.ts",
 ];
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });

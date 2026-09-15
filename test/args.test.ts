@@ -138,6 +138,59 @@ function main(): void {
   {
     const o = parseClaudeArgs(["-p", "say hi"]);
     assertEq(o.printPrompt, "say hi", "print prompt");
+    assertEq(o.printMode, true, "print prompt sets printMode");
+  }
+
+  // bare -p (t3code text-gen): next token is a flag, so it is NOT consumed.
+  {
+    const o = parseClaudeArgs(["-p", "--output-format", "json"]);
+    assertEq(o.printMode, true, "bare -p sets printMode");
+    assertEq(o.printPrompt, undefined, "bare -p does not eat the next flag");
+    assertEq(o.outputFormat, "json", "bare -p lets --output-format parse");
+  }
+
+  // full t3code text-generation argv shape.
+  {
+    const o = parseClaudeArgs([
+      "-p",
+      "--output-format",
+      "json",
+      "--json-schema",
+      '{"type":"object","properties":{"subject":{"type":"string"}},"required":["subject"]}',
+      "--model",
+      "claude-sonnet",
+      "--effort",
+      "low",
+      "--settings",
+      '{"disableAllHooks":true}',
+      "--tools",
+      "",
+      "--disable-slash-commands",
+      "--strict-mcp-config",
+      "--permission-mode",
+      "dontAsk",
+    ]);
+    assertEq(o.printMode, true, "t3gen argv: printMode");
+    assertEq(o.printPrompt, undefined, "t3gen argv: prompt via stdin");
+    assertEq(o.outputFormat, "json", "t3gen argv: output json");
+    assertEq(
+      o.jsonSchema?.includes('"subject"'),
+      true,
+      "t3gen argv: json-schema preserved",
+    );
+    assertEq(o.model, "claude-sonnet", "t3gen argv: model");
+    assertEq(o.effort, "low", "t3gen argv: effort");
+    assertEq(o.settingsPath, '{"disableAllHooks":true}', "t3gen argv: settings");
+    // dontAsk is not a shim permission mode -> undefined (accepted, no error).
+    assertEq(o.permissionMode, undefined, "t3gen argv: dontAsk -> undefined");
+    assertArrayEq(o.unrecognized, [], "t3gen argv: nothing unrecognized");
+  }
+
+  // --print=<value> form
+  {
+    const o = parseClaudeArgs(["--print=hello"]);
+    assertEq(o.printMode, true, "print= sets printMode");
+    assertEq(o.printPrompt, "hello", "print= carries value");
   }
 
   // Unknown flags accumulate

@@ -50,6 +50,11 @@ export interface ClaudeShimOptions {
   printPrompt: string | undefined;
   /** Set when `--dangerously-skip-permissions` is present. */
   dangerouslySkipPermissions: boolean;
+  /**
+   * Set when `--include-partial-messages` is present: emit `stream_event`
+   * partial messages alongside the assembled `assistant` message.
+   */
+  includePartialMessages: boolean;
   /** App-provided session id (the SDK's `sessionId` option). */
   sessionId: string | undefined;
   /** `--json-schema <json>` payload for structured-output mode. */
@@ -108,7 +113,6 @@ const BOOLEAN_FLAGS = new Set([
 const IGNORED_FLAGS = new Set([
   "--strict-mcp-config",
   "--disable-slash-commands",
-  "--include-partial-messages",
   "--replay-user-messages",
 ]);
 
@@ -139,6 +143,7 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
     maxTurns: undefined,
     printPrompt: undefined,
     dangerouslySkipPermissions: false,
+    includePartialMessages: false,
     sessionId: undefined,
     jsonSchema: undefined,
     help: false,
@@ -176,6 +181,8 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
         // Full-access: the SDK sends this (instead of --permission-mode) to
         // mean bypassPermissions.
         opts.permissionMode = "bypassPermissions";
+      } else if (arg === "--include-partial-messages") {
+        opts.includePartialMessages = true;
       }
       // The rest are intentionally ignored.
       i++;

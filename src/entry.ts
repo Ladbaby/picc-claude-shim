@@ -176,6 +176,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     toolsAvailable: () => [],
     slashCommandsAvailable: () => [],
     permissionMode: opts.permissionMode ?? "default",
+    includePartialMessages: opts.includePartialMessages ?? false,
   });
 
   // 3. Emit system/init NOW. This is the single most latency-sensitive

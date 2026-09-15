@@ -169,6 +169,25 @@ export interface SDKControlCancelRequest {
   request_id: string;
 }
 
+/**
+ * A `stream_event` message — a raw Anthropic streaming event forwarded to the
+ * SDK. Only emitted when the parent requested partials
+ * (`--include-partial-messages` / `includePartialMessages: true`).
+ *
+ * Envelope mirrors `SDKPartialAssistantMessageSchema` in Claude Code's
+ * `coreSchemas.ts`: exactly `{type, event, parent_tool_use_id, uuid,
+ * session_id}`. `event` is one of Anthropic's `BetaRawMessageStreamEvent`s
+ * (message_start, content_block_start/delta/stop, message_delta,
+ * message_stop) and is passed through verbatim.
+ */
+export interface SDKStreamEvent {
+  type: "stream_event";
+  event: unknown;
+  parent_tool_use_id: string | null;
+  uuid: string;
+  session_id: string;
+}
+
 export type SDKMessageOut =
   | SDKSystemMessage
   | SDKAssistantMessage
@@ -176,7 +195,8 @@ export type SDKMessageOut =
   | SDKResultMessage
   | SDKControlRequest
   | SDKControlResponse
-  | SDKControlCancelRequest;
+  | SDKControlCancelRequest
+  | SDKStreamEvent;
 
 // =====================================================================
 // Per-session buffer: accumulating partial assistant content
@@ -193,6 +213,14 @@ export interface AssistantBuffer {
   toolUses: Map<string, ToolUseAccum>;
   thinkingSegments: string[];
   flushed: boolean;
+  // ---- stream_event (partial) bookkeeping ------------------------------
+  // Anthropic content-block index counter and the index assigned to each
+  // logical unit ("text", "thinking", or a tool-call id) the first time that
+  // unit starts streaming. Used to emit content_block_* events with a stable
+  // `index` and to close every opened block at message_end.
+  nextBlockIndex: number;
+  blockIndexByUnit: Map<string, number>;
+  openBlocks: number[];
 }
 
 export function createAssistantBuffer(): AssistantBuffer {
@@ -204,6 +232,9 @@ export function createAssistantBuffer(): AssistantBuffer {
     toolUses: new Map(),
     thinkingSegments: [],
     flushed: false,
+    nextBlockIndex: 0,
+    blockIndexByUnit: new Map(),
+    openBlocks: [],
   };
 }
 
@@ -296,6 +327,145 @@ export function flushAssistantBuffer(buf: AssistantBuffer): AssistantContentBloc
   if (thinking.length > 0) blocks.push({ type: "thinking", thinking });
   buf.flushed = true;
   return blocks;
+}
+
+// =====================================================================
+// stream_event (partial) emission
+//
+// When `emitter.includePartialMessages` is set we forward Anthropic's raw
+// streaming events, one `stream_event` NDJSON line each, so the SDK's
+// `includePartialMessages` consumer can render incrementally. All helpers are
+// no-ops when the flag is off.
+// =====================================================================
+
+/**
+ * Wrap a raw Anthropic event in the `stream_event` envelope and emit it.
+ * No-op when partials are disabled.
+ */
+export function emitStreamEvent(state: TranslatorState, event: unknown): void {
+  if (!state.emitter.includePartialMessages) return;
+  const msg: SDKStreamEvent = {
+    type: "stream_event",
+    event,
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: state.emitter.sessionId,
+  };
+  state.emitter.emit(msg);
+}
+
+/**
+ * Return (and lazily assign) the Anthropic content-block index for a logical
+ * unit. A unit is `"text"`, `"thinking"`, or a tool-call id. The first call
+ * for a unit opens it with a `content_block_start`; later calls reuse the
+ * index. No-op when partials are disabled.
+ */
+function streamOpenUnit(
+  state: TranslatorState,
+  buf: AssistantBuffer,
+  unitKey: string,
+  startBlock: Record<string, unknown>,
+): number | undefined {
+  if (!state.emitter.includePartialMessages) return undefined;
+  let idx = buf.blockIndexByUnit.get(unitKey);
+  if (idx === undefined) {
+    idx = buf.nextBlockIndex++;
+    buf.blockIndexByUnit.set(unitKey, idx);
+    buf.openBlocks.push(idx);
+    emitStreamEvent(state, { type: "content_block_start", index: idx, content_block: startBlock });
+  }
+  return idx;
+}
+
+/** Emit a text delta (opening the text block on first use). */
+function streamTextDelta(state: TranslatorState, buf: AssistantBuffer, delta: string): void {
+  const idx = streamOpenUnit(state, buf, "text", { type: "text", text: "", citations: null });
+  if (idx === undefined) return;
+  emitStreamEvent(state, { type: "content_block_delta", index: idx, delta: { type: "text_delta", text: delta } });
+}
+
+/** Emit a thinking delta (opening the thinking block on first use). */
+function streamThinkingDelta(state: TranslatorState, buf: AssistantBuffer, delta: string): void {
+  const idx = streamOpenUnit(state, buf, "thinking", { type: "thinking", thinking: "" });
+  if (idx === undefined) return;
+  emitStreamEvent(state, { type: "content_block_delta", index: idx, delta: { type: "thinking_delta", thinking: delta } });
+}
+
+/** Open a tool_use block when a tool call begins streaming. */
+function streamToolUseStart(state: TranslatorState, buf: AssistantBuffer, id: string, name: string): void {
+  if (!id) return;
+  streamOpenUnit(state, buf, id, { type: "tool_use", id, name: toClaudeToolName(name), input: {} });
+}
+
+/** Emit a tool_use input_json delta (a fragment of the arguments JSON). */
+function streamToolUseDelta(state: TranslatorState, buf: AssistantBuffer, id: string, fragment: string): void {
+  if (!state.emitter.includePartialMessages) return;
+  const idx = buf.blockIndexByUnit.get(id);
+  if (idx === undefined) return;
+  emitStreamEvent(state, { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: fragment } });
+}
+
+/** Close a single content block (tool_use) that has finished. */
+function streamCloseUnit(state: TranslatorState, buf: AssistantBuffer, unitKey: string): void {
+  if (!state.emitter.includePartialMessages) return;
+  const idx = buf.blockIndexByUnit.get(unitKey);
+  if (idx === undefined) return;
+  buf.openBlocks = buf.openBlocks.filter((b) => b !== idx);
+  emitStreamEvent(state, { type: "content_block_stop", index: idx });
+}
+
+/**
+ * Emit the `message_start` event for a new assistant message.
+ */
+function streamMessageStart(state: TranslatorState): void {
+  if (!state.emitter.includePartialMessages) return;
+  emitStreamEvent(state, {
+    type: "message_start",
+    message: {
+      id: `msg_${randomUUID().slice(0, 24)}`,
+      type: "message",
+      role: "assistant",
+      model: state.emitter.modelId,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    },
+  });
+}
+
+/** Close every still-open content block (text/thinking) for the message. */
+function streamCloseOpenBlocks(state: TranslatorState, buf: AssistantBuffer): void {
+  if (!state.emitter.includePartialMessages) return;
+  for (const idx of buf.openBlocks) {
+    emitStreamEvent(state, { type: "content_block_stop", index: idx });
+  }
+  buf.openBlocks = [];
+}
+
+/**
+ * Emit the `message_delta` (carrying `stop_reason` + running output tokens)
+ * and the final `message_stop` for a completed assistant message. Called at
+ * `message_end`, after any open blocks have been closed.
+ */
+function streamMessageDeltaAndStop(
+  state: TranslatorState,
+  stopReason: string | null,
+  outputTokens: number,
+): void {
+  if (!state.emitter.includePartialMessages) return;
+  emitStreamEvent(state, {
+    type: "message_delta",
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: outputTokens },
+    context_management: null,
+  });
+  emitStreamEvent(state, { type: "message_stop" });
 }
 
 // =====================================================================
@@ -456,6 +626,12 @@ export interface EmitterContext extends OutputEmitter {
   pendingSynthesis?: SynthesizedResultFields;
   /** Latest assistant message we have flushed. */
   lastFlushedText: string;
+  /**
+   * When true, emit `stream_event` partial messages in addition to the
+   * assembled `assistant` message. Set from `deps.includePartialMessages` at
+   * state-creation time.
+   */
+  includePartialMessages: boolean;
 }
 
 export interface TranslatorDeps {
@@ -473,6 +649,12 @@ export interface TranslatorDeps {
   slashCommandsAvailable?: () => string[];
   /** Permission mode that's currently in effect. */
   permissionMode?: string;
+  /**
+   * When true, also emit `stream_event` partial messages (Anthropic raw
+   * streaming events) alongside the assembled `assistant` message. Driven by
+   * the parent's `--include-partial-messages` / `includePartialMessages`.
+   */
+  includePartialMessages?: boolean;
 }
 
 export interface TranslatorState {
@@ -496,6 +678,7 @@ export function createTranslatorState(deps: TranslatorDeps): TranslatorState {
     sessionId: "",
     lastFlushedText: "",
     pendingSynthesis: undefined,
+    includePartialMessages: deps.includePartialMessages ?? false,
   };
 
   return {
@@ -590,6 +773,7 @@ export function handleAgentEvent(
       const buf = createAssistantBuffer();
       const key = String(message.timestamp);
       state.bufs.set(key, buf);
+      streamMessageStart(state);
       return undefined;
     }
 
@@ -607,6 +791,7 @@ export function handleAgentEvent(
           // boundary marker — nothing to buffer.
           if (ev.type === "text_delta") {
             buf.textSegments.push(ev.delta);
+            streamTextDelta(state, buf, ev.delta);
           }
           return undefined;
         }
@@ -614,6 +799,7 @@ export function handleAgentEvent(
         case "thinking_delta":
           if (ev.type === "thinking_delta") {
             buf.thinkingSegments.push(ev.delta);
+            streamThinkingDelta(state, buf, ev.delta);
           }
           return undefined;
         case "text_end":
@@ -628,6 +814,7 @@ export function handleAgentEvent(
           const id = tc.id ?? `toolu_${randomUUID().slice(0, 24)}`;
           const name = tc.name ?? "unknown";
           buf.toolUses.set(id, { id, name, input: "" });
+          streamToolUseStart(state, buf, id, name);
           return undefined;
         }
         case "toolcall_delta": {
@@ -643,6 +830,7 @@ export function handleAgentEvent(
           accum.input += ev.delta;
           // Also update the name lazily as it may stream in.
           if (tc.name) accum.name = tc.name;
+          streamToolUseDelta(state, buf, id, ev.delta);
           return undefined;
         }
         case "toolcall_end": {
@@ -659,6 +847,7 @@ export function handleAgentEvent(
           // toolCall.arguments is the final parsed object; stringify it.
           accum.input = JSON.stringify(toolCall.arguments ?? {});
           if (toolCall.name) accum.name = toolCall.name;
+          streamCloseUnit(state, buf, id);
 
           // If a permission-ask handler is configured, surface the tool
           // call to it. The handler is expected to synchronously return
@@ -695,6 +884,13 @@ export function handleAgentEvent(
         content.push({ type: "text", text: "" });
       }
       const assistant = message as unknown as AssistantMessage;
+      // Close any still-open text/thinking blocks and finish the stream
+      // (message_delta carries stop_reason + running output tokens, then
+      // message_stop). Emitted before the assembled `assistant` so partials
+      // complete before the deduplicated full message, matching Claude Code.
+      const stopReason = toClaudeStopReason(assistant.stopReason);
+      streamCloseOpenBlocks(state, buf);
+      streamMessageDeltaAndStop(state, stopReason, assistant.usage?.output ?? 0);
       const assistantMsg: SDKAssistantMessage = {
         type: "assistant",
         parent_tool_use_id: null,

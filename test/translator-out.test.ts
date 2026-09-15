@@ -343,3 +343,166 @@ assertEq(toAnthropicUsage(undefined) === undefined, true, "usage undefined -> un
     "control_request routed to responder",
   );
 }
+
+// 12. Phase 2e: stream_event partials. A fresh state with
+//     includePartialMessages: true should emit the full Anthropic raw-stream
+//     sequence in order, and the default state (flag off) should emit none.
+{
+  const partialCol = new StringCollector();
+  const partialState = createTranslatorState({
+    cwd: "C:\\Users\\Test\\Projects\\Demo",
+    modelId: "claude-sonnet",
+    toolsAvailable: () => ["Read", "Bash"],
+    permissionMode: "default",
+    includePartialMessages: true,
+  });
+  partialState.emitter.emit = (msg: SDKMessageOut) => {
+    partialCol.writable.write(JSON.stringify(msg) + "\n");
+  };
+  // Set the session id so envelopes carry it.
+  emitSystemInit(partialState, "session-p", {
+    cwd: "C:\\Users\\Test\\Projects\\Demo",
+    modelId: "claude-sonnet",
+    toolsAvailable: () => ["Read", "Bash"],
+  });
+
+  partialCol.lines = [];
+  const pts = "1700000000999";
+  // text-only assistant turn with a tool call to exercise multiple blocks.
+  handleAgentEvent(partialState, {
+    type: "message_start",
+    message: { role: "assistant", content: [], timestamp: pts } as never,
+  } as never, {} as never);
+  handleAgentEvent(partialState, {
+    type: "message_update",
+    message: { role: "assistant", content: [], timestamp: pts } as never,
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "running ",
+      partial: { content: [] } as never,
+    },
+  } as never, {} as never);
+  handleAgentEvent(partialState, {
+    type: "message_update",
+    message: { role: "assistant", content: [], timestamp: pts } as never,
+    assistantMessageEvent: {
+      type: "toolcall_start",
+      contentIndex: 0,
+      partial: { content: [{ id: "toolu_p", name: "Bash" }] } as never,
+    },
+  } as never, {} as never);
+  handleAgentEvent(partialState, {
+    type: "message_update",
+    message: { role: "assistant", content: [], timestamp: pts } as never,
+    assistantMessageEvent: {
+      type: "toolcall_delta",
+      contentIndex: 0,
+      delta: '{"command":"ls"}',
+      partial: { content: [{ id: "toolu_p", name: "Bash" }] } as never,
+    },
+  } as never, {} as never);
+  handleAgentEvent(partialState, {
+    type: "message_update",
+    message: { role: "assistant", content: [], timestamp: pts } as never,
+    assistantMessageEvent: {
+      type: "toolcall_end",
+      contentIndex: 0,
+      toolCall: { id: "toolu_p", name: "Bash", arguments: { command: "ls" } } as never,
+    },
+  } as never, {} as never);
+  handleAgentEvent(partialState, {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "running " }, { type: "tool_use", id: "toolu_p", name: "Bash", input: { command: "ls" } }],
+      model: "claude-sonnet",
+      usage: { input: 7, output: 3, cacheRead: 1, cacheWrite: 0 },
+      stopReason: "toolUse",
+      timestamp: pts,
+    } as never,
+  } as never, {} as never);
+
+  const se = partialCol
+    .messages()
+    .filter((m) => m.type === "stream_event") as Array<{
+    event: { type: string; [k: string]: unknown };
+    uuid?: string;
+    session_id?: string;
+    parent_tool_use_id?: string | null;
+  }>;
+  const order = se.map((m) => m.event.type);
+  assertEq(
+    JSON.stringify(order),
+    JSON.stringify([
+      "message_start",
+      "content_block_start", // text
+      "content_block_delta", // text
+      "content_block_start", // tool_use
+      "content_block_delta", // input_json
+      "content_block_stop",  // tool_use closed at toolcall_end
+      "content_block_stop",  // text closed at message_end
+      "message_delta",
+      "message_stop",
+    ]),
+    "partial stream event order",
+  );
+  // Every envelope carries the wire envelope fields.
+  assertEq(se.every((m) => typeof m.uuid === "string"), true, "partial envelopes have uuid");
+  assertEq(se.every((m) => m.session_id === "session-p"), true, "partial envelopes have session_id");
+  assertEq(se.every((m) => m.parent_tool_use_id === null), true, "partial envelopes parent_tool_use_id null");
+  // message_delta carries stop_reason + output_tokens.
+  const md = se.find((m) => m.event.type === "message_delta")!;
+  const mdDelta = md.event.delta as { stop_reason: string };
+  const mdUsage = md.event.usage as { output_tokens: number };
+  assertEq(mdDelta.stop_reason, "tool_use", "partial message_delta stop_reason");
+  assertEq(mdUsage.output_tokens, 3, "partial message_delta output_tokens");
+  // content_block indices are 0 (text) and 1 (tool_use).
+  const starts = se
+    .filter((m) => m.event.type === "content_block_start")
+    .map((m) => m.event.index as number);
+  assertEq(JSON.stringify(starts), JSON.stringify([0, 1]), "partial content_block indices");
+
+  // Default state (flag off) emits NO stream_event.
+  const offCol = new StringCollector();
+  const offState = createTranslatorState({
+    cwd: "C:\\Users\\Test\\Projects\\Demo",
+    modelId: "claude-sonnet",
+    toolsAvailable: () => ["Read", "Bash"],
+  });
+  offState.emitter.emit = (msg: SDKMessageOut) => {
+    offCol.writable.write(JSON.stringify(msg) + "\n");
+  };
+  const ots = "1700000000888";
+  handleAgentEvent(offState, {
+    type: "message_start",
+    message: { role: "assistant", content: [], timestamp: ots } as never,
+  } as never, {} as never);
+  handleAgentEvent(offState, {
+    type: "message_update",
+    message: { role: "assistant", content: [], timestamp: ots } as never,
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "hi",
+      partial: { content: [] } as never,
+    },
+  } as never, {} as never);
+  handleAgentEvent(offState, {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "hi" }],
+      model: "claude-sonnet",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+      stopReason: "stop",
+      timestamp: ots,
+    } as never,
+  } as never, {} as never);
+  assertEq(
+    offCol.messages().filter((m) => m.type === "stream_event").length,
+    0,
+    "no stream_event when flag off",
+  );
+}
+

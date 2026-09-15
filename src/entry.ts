@@ -51,6 +51,7 @@ import {
 import { fromClaudeToolName } from "./tool-names.js";
 import { synthesizeUsageAndCost } from "./cost.js";
 import { createInterface } from "node:readline";
+import { randomUUID } from "node:crypto";
 import { CLAUDE_CODE_VERSION_LINE } from "./version.js";
 
 const PI_VERSION = CLAUDE_CODE_VERSION_LINE;
@@ -150,49 +151,56 @@ async function runPrintMode(opts: ClaudeShimOptions, cwd: string): Promise<numbe
 // =====================================================================
 
 async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<number> {
-  const buildResult = await buildPiSession(opts, cwd);
-  if (!buildResult.ok) return writeBuildError(buildResult.error);
-
-  const { session } = buildResult.value;
-  const modelId = describeModelId(session);
-
   // The wire-level session id. If the SDK asked us to use a specific
-  // session id (`--session-id`, from the `sessionId` query option), we must
-  // echo that exact value in `init.session_id` and every message so t3code
-  // can correlate it. Otherwise use pi's own id.
-  const wireSessionId = opts.sessionId ?? session.sessionId;
+  // session id (`--session-id`, from the `sessionId` query option), echo
+  // that exact value in `init.session_id` and every message so t3code can
+  // correlate it. Otherwise mint one up front. We no longer depend on the
+  // (lazily-built) pi session's own id for the wire — that lets us emit
+  // `system/init` immediately without waiting ~30s for the pi runtime.
+  const wireSessionId = opts.sessionId ?? randomUUID();
 
-  // 1. The hapi-compatible session JSONL must exist before any
-  //    `system/init` line is emitted.
-  const sessionFile = ensureHapiCompatibleSessionFile({
-    cwd,
-    sessionId: session.sessionId,
-    modelId,
-  });
+  // Model name surfaced in `system/init` before the session exists. Per
+  // assistant messages carry their real `model` from the pi event, so this
+  // only needs to be plausible at init time.
+  const initModelId = opts.model ?? "claude-sonnet";
 
-  // 2. Permission gate: open for any non-bypass mode (the SDK drives
+  // 1. Permission gate: open for any non-bypass mode (the SDK drives
   //    permissions via an in-process canUseTool callback).
   const gateOpen = computeGateOpen(opts.permissionPromptTool, opts.permissionMode);
 
-  // 3. Build a stdio writer + translator state.
+  // 2. Translator state (stdout emitter + buffers). Eager — needed to emit
+  //    init and to answer control_requests as they arrive.
   const state: TranslatorState = createTranslatorState({
     cwd,
-    modelId,
-    toolsAvailable: () => listActiveToolsLowercase(session),
+    modelId: initModelId,
+    toolsAvailable: () => [],
     slashCommandsAvailable: () => [],
     permissionMode: opts.permissionMode ?? "default",
   });
 
-  // 4. Pending permissions map shared between stdin reader and the
-  //    permission-ask callback. When the parent replies with
-  //    `control_response`, we resolve the pending promise and unblock
-  //    the agent loop.
-  const pending = new Map<string, PendingPermission>();
+  // 3. Emit system/init NOW. This is the single most latency-sensitive
+  //    message: T3 Code's capabilities probe awaits `initializationResult()`
+  //    with a 25s budget and never sends a prompt. Building the pi session
+  //    takes ~30s, so it MUST be deferred (below) or the probe times out.
+  emitSystemInit(state, wireSessionId, {
+    cwd,
+    modelId: initModelId,
+    toolsAvailable: () => [],
+    slashCommandsAvailable: () => [],
+    permissionMode: opts.permissionMode ?? "default",
+  });
 
-  // Tracks whether the run hit an error (prompt rejection or an assistant
-  // `error` event) so the final `result` reports `error_during_execution`
-  // instead of `success`.
+  // 4. Lazy pi session. Built only when a user message actually arrives.
+  let session: AgentSession | null = null;
+  let sessionModelId = initModelId;
+  let sessionFile: SessionFileState | null = null;
+  let sessionBuilt = false;
+  let agentEnded = false;
+  let buildPromise: Promise<void> | null = null;
   let runErrored = false;
+  let firstMessage = true;
+
+  const pending = new Map<string, PendingPermission>();
 
   const permissionAsk = async (
     toolName: string,
@@ -204,7 +212,6 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   > => {
     if (!gateOpen) return { behavior: "allow" };
     const requestId = emitControlRequest(state, toolName, input, toolCallId);
-
     return new Promise((resolve) => {
       pending.set(requestId, {
         requestId,
@@ -212,9 +219,6 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
         toolCallId,
         input,
         resolve: (result) => {
-          // If the parent passes `updatedInput`, the translator (via
-          // the entry's tool_call handler) will mutate the live input
-          // object. Here we just relay.
           resolve(result);
           pending.delete(requestId);
         },
@@ -222,160 +226,153 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     });
   };
 
-  // 5. Subscribe to pi events.
-  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    // Surface assistant-level errors (e.g. a failed turn) so the final
-    // result reports error_during_execution rather than success.
-    if (event.type === "message_update" && event.assistantMessageEvent.type === "error") {
-      runErrored = true;
-    }
-    translateAgentEvent(state, event, {
-      cwd,
-      modelId,
-      toolsAvailable: () => listActiveToolsLowercase(session),
-      slashCommandsAvailable: () => [],
-      permissionMode: opts.permissionMode ?? "default",
-    }, gateOpen ? permissionAsk : undefined);
-
-    // Mirror completed messages into the hapi session JSONL.
-    if (event.type === "message_end") {
-      const message = event.message;
-      appendSessionEntry(sessionFile, {
-        kind: message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "system",
-        message: {
-          role: message.role,
-          content: (message as { content?: unknown }).content,
-        },
-        sessionId: session.sessionId,
+  // Subscribe the (just-built) session to pi events and translate them.
+  const wireSessionEvents = (s: AgentSession): void => {
+    s.subscribe((event: AgentSessionEvent) => {
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "error") {
+        runErrored = true;
+      }
+      translateAgentEvent(state, event, {
         cwd,
-      });
-    } else if (event.type === "agent_end") {
-      appendSessionEntry(sessionFile, {
-        kind: "system",
-        message: { role: "system", content: "agent_end" },
-        sessionId: session.sessionId,
-        cwd,
-      });
-    }
-  });
+        modelId: sessionModelId,
+        toolsAvailable: () => listActiveToolsLowercase(s),
+        slashCommandsAvailable: () => [],
+        permissionMode: opts.permissionMode ?? "default",
+      }, gateOpen ? permissionAsk : undefined);
 
-  // 6. Emit system/init now that we have the session id.
-  emitSystemInit(state, wireSessionId, {
-    cwd,
-    modelId,
-    toolsAvailable: () => listActiveToolsLowercase(session),
-    slashCommandsAvailable: () => [],
-    permissionMode: opts.permissionMode ?? "default",
-  });
-
-  // 7. Read NDJSON from stdin.
-  const rl = createInterface({ input: process.stdin });
-  let firstMessage = true;
-  const stdinPromise = new Promise<void>((resolveStdin) => {
-    let stdinClosed = false;
-    rl.on("line", (line) => {
-      if (line.trim().length === 0) return;
-      try {
-        handleClaudeInput(line, {
-          pendingPermissions: pending,
-          respondControlRequest: (requestId: string, request: { subtype: string; [k: string]: unknown }) => {
-            try {
-              respondControlRequest(state, requestId, request);
-            } catch (e) {
-              process.stderr.write(
-                `pi-claude-shim: control_request ${request.subtype} failed: ${(e as Error).message}\n`,
-              );
-            }
+      if (event.type === "agent_end") {
+        agentEnded = true;
+        if (sessionFile) {
+          appendSessionEntry(sessionFile, {
+            kind: "system",
+            message: { role: "system", content: "agent_end" },
+            sessionId: s.sessionId,
+            cwd,
+          });
+        }
+        return;
+      }
+      if (event.type === "message_end" && sessionFile) {
+        const message = event.message;
+        appendSessionEntry(sessionFile, {
+          kind: message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "system",
+          message: {
+            role: message.role,
+            content: (message as { content?: unknown }).content,
           },
-          onUserMessage: (text: string) => {
-            appendSessionEntry(sessionFile, {
-              kind: "user",
-              message: { role: "user", content: text },
-              sessionId: session.sessionId,
-              cwd,
-            });
-            // The first message drives the initial agent run.
-            // Subsequent messages use followUp so they queue behind
-            // an in-flight turn. hapi always sends `prompt` only once
-            // per session in remote mode and uses control_request for
-            // tool permissions — but it's safe to accept multiple user
-            // messages here.
-            const streamBehavior = firstMessage
-              ? undefined
-              : ("followUp" as const);
-            firstMessage = false;
-            void session
-              .prompt(text, streamBehavior ? { streamingBehavior: streamBehavior } : {})
-              .catch((e: unknown) => {
-                runErrored = true;
-                process.stderr.write(
-                  `pi-claude-shim: prompt failed: ${(e as Error).message}\n`,
-                );
-              });
-          },
+          sessionId: s.sessionId,
+          cwd,
         });
-      } catch (e) {
-        process.stderr.write(
-          `pi-claude-shim: stdin handler error: ${(e as Error).message}\n`,
-        );
       }
     });
-    rl.on("close", () => {
-      stdinClosed = true;
-      resolveStdin();
-    });
-    void stdinClosed;
-  });
-  void stdinPromise;
+  };
 
-  // 8. Wait for BOTH stdin close AND agent_end before synthesizing the
-  //    final `result`. The race: hapi closes stdin first to signal
-  //    "no more inputs"; the agent may still have a turn running.
+  // Build the pi session exactly once; concurrent user messages share it.
+  const ensureSession = (): Promise<void> => {
+    if (!buildPromise) {
+      buildPromise = (async () => {
+        const buildResult = await buildPiSession(opts, cwd);
+        if (!buildResult.ok) throw new Error(buildResult.error);
+        const s = buildResult.value.session;
+        session = s;
+        sessionModelId = describeModelId(s);
+        sessionFile = ensureHapiCompatibleSessionFile({
+          cwd,
+          sessionId: s.sessionId,
+          modelId: sessionModelId,
+        });
+        wireSessionEvents(s);
+        sessionBuilt = true;
+      })();
+    }
+    return buildPromise;
+  };
+
+  // 5. Read NDJSON from stdin.
+  const rl = createInterface({ input: process.stdin });
+  rl.on("line", (line) => {
+    if (line.trim().length === 0) return;
+    try {
+      handleClaudeInput(line, {
+        pendingPermissions: pending,
+        respondControlRequest: (requestId: string, request: { subtype: string; [k: string]: unknown }) => {
+          try {
+            respondControlRequest(state, requestId, request);
+          } catch (e) {
+            process.stderr.write(
+              `pi-claude-shim: control_request ${request.subtype} failed: ${(e as Error).message}\n`,
+            );
+          }
+        },
+        onUserMessage: (text: string) => {
+          // Kick off the (one-time) pi session build, then prompt. The probe
+          // never reaches here, so this ~30s cost is paid only for real runs.
+          void (async () => {
+            try {
+              await ensureSession();
+              if (!session || !sessionFile) return;
+              appendSessionEntry(sessionFile, {
+                kind: "user",
+                message: { role: "user", content: text },
+                sessionId: session.sessionId,
+                cwd,
+              });
+              const streamBehavior = firstMessage ? undefined : ("followUp" as const);
+              firstMessage = false;
+              await session.prompt(text, streamBehavior ? { streamingBehavior: streamBehavior } : {});
+            } catch (e) {
+              runErrored = true;
+              agentEnded = true; // unblock the wait; final result reports the error
+              process.stderr.write(`pi-claude-shim: session failed: ${(e as Error).message}\n`);
+            }
+          })();
+        },
+      });
+    } catch (e) {
+      process.stderr.write(`pi-claude-shim: stdin handler error: ${(e as Error).message}\n`);
+    }
+  });
+
   let stdinClosed = false;
-  let agentEnded = false;
   rl.on("close", () => {
     stdinClosed = true;
   });
 
+  // 6. Wait for BOTH stdin close AND (no session built, or agent finished).
+  //    A probe sends no user message, so sessionBuilt stays false and we
+  //    resolve as soon as stdin closes — no 90s stall.
   await new Promise<void>((resolve) => {
-    let timer: NodeJS.Timeout | null = null;
-    const check = () => {
-      if (stdinClosed && agentEnded) {
-        if (timer) clearTimeout(timer);
+    const interval = setInterval(() => {
+      if (stdinClosed && (!sessionBuilt || agentEnded)) {
+        clearInterval(interval);
         resolve();
       }
-    };
-    const unsub2 = session.subscribe((ev) => {
-      if (ev.type === "agent_end") {
-        agentEnded = true;
-        check();
-      }
-    });
-    const interval = setInterval(check, 25);
-    // Safety: resolve after 90s even if signals arrive out of order.
-    timer = setTimeout(() => {
+    }, 25);
+    const timer = setTimeout(() => {
       clearInterval(interval);
-      unsub2();
       resolve();
     }, 90_000);
-    check();
+    void timer;
+    // Resolve immediately if stdin is already closed and nothing to do.
+    if (stdinClosed && !sessionBuilt) {
+      clearInterval(interval);
+      resolve();
+    }
   });
 
-  // 10. Synthesis + final `result`.
-  const stats = typeof session.getSessionStats === "function"
-    ? session.getSessionStats()
-    : undefined;
-  const synthesis = synthesizeUsageAndCost(
-    stats,
-    state.emitter.startedAtMs,
-    modelId,
-  );
+  // 7. Synthesis + final `result` (zeros if no session was ever built).
+  //    Cast to sidestep TS narrowing the closure-mutated `session` to `never`.
+  const sRef = session as AgentSession | null;
+  const stats =
+    sRef && typeof sRef.getSessionStats === "function"
+      ? sRef.getSessionStats()
+      : undefined;
+  const synthesis = synthesizeUsageAndCost(stats, state.emitter.startedAtMs, sessionModelId);
   emitResult(state, synthesis, wireSessionId, runErrored, false);
 
-  // 11. Cleanup.
+  // 8. Cleanup.
   rl.close();
-  unsubscribe();
-  session.dispose();
+  if (sRef) sRef.dispose();
   void state;
   return 0;
 }

@@ -156,7 +156,8 @@ async function runJsonMode(opts: ClaudeShimOptions, cwd: string): Promise<number
     return 1;
   }
 
-  const buildResult = await buildPiSession(opts, cwd, "builtin");
+  const wireSessionId = opts.sessionId ?? randomUUID();
+  const buildResult = await buildPiSession(opts, cwd, "builtin", wireSessionId);
   if (!buildResult.ok) return writeBuildError(buildResult.error);
 
   const { session } = buildResult.value;
@@ -206,7 +207,8 @@ async function runJsonMode(opts: ClaudeShimOptions, cwd: string): Promise<number
 // =====================================================================
 
 async function runPrintMode(opts: ClaudeShimOptions, cwd: string): Promise<number> {
-  const buildResult = await buildPiSession(opts, cwd, undefined);
+  const wireSessionId = opts.sessionId ?? randomUUID();
+  const buildResult = await buildPiSession(opts, cwd, undefined, wireSessionId);
   if (!buildResult.ok) return writeBuildError(buildResult.error);
 
   const { session } = buildResult.value;
@@ -232,13 +234,17 @@ async function runPrintMode(opts: ClaudeShimOptions, cwd: string): Promise<numbe
 // =====================================================================
 
 async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<number> {
-  // The wire-level session id. If the SDK asked us to use a specific
-  // session id (`--session-id`, from the `sessionId` query option), echo
-  // that exact value in `init.session_id` and every message so t3code can
-  // correlate it. Otherwise mint one up front. We no longer depend on the
-  // (lazily-built) pi session's own id for the wire — that lets us emit
-  // `system/init` immediately without waiting ~30s for the pi runtime.
-  const wireSessionId = opts.sessionId ?? randomUUID();
+  // The wire-level session id. Precedence:
+  //   1. `opts.resume` — on resume the host re-sends the previous wire id and
+  //      (with no `--session-id`), so the wire id MUST stay equal to the id of
+  //      the on-disk pi session we're about to open. Otherwise the resume
+  //      reports a fresh id and the *next* resume misses.
+  //   2. `opts.sessionId` — the host asked for a specific id (fresh session).
+  //   3. mint one. We no longer depend on the (lazily-built) pi session's own
+  //      id for the wire — that lets us emit `system/init` immediately without
+  //      waiting ~30s for the pi runtime. The pi session is created with this
+  //      exact id (see buildPiSession) so resume lookups match.
+  const wireSessionId = opts.resume ?? opts.sessionId ?? randomUUID();
 
   // Model name surfaced in `system/init` before the session exists. Per
   // assistant messages carry their real `model` from the pi event, so this
@@ -276,8 +282,17 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   let session: AgentSession | null = null;
   let sessionModelId = initModelId;
   let sessionFile: SessionFileState | null = null;
+  let sessionStartMs = 0;
   let sessionBuilt = false;
-  let agentEnded = false;
+  /**
+   * True while a pi agent run (turn) is in flight — between `agent_start`
+   * and a final `agent_end` (not a retry). Used as the exit gate: the process
+   * stays alive while a turn is running, even after stdin closes, so a long
+   * subagent turn isn't killed mid-flight.
+   */
+  let agentActive = false;
+  /** Counts per-turn `result` messages emitted; a zero means no completed run. */
+  let turnResultsEmitted = 0;
   let buildPromise: Promise<void> | null = null;
   let runErrored = false;
   let firstMessage = true;
@@ -310,6 +325,19 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
 
   // Subscribe the (just-built) session to pi events and translate them.
   const wireSessionEvents = (s: AgentSession): void => {
+    // Emit a Claude `result` message for a completed run (turn). pi fires
+    // `agent_start`…`agent_end` per run, and drains any queued follow-ups
+    // (e.g. background-subagent completion notifications) before `agent_end`,
+    // so one non-retry `agent_end` corresponds to one full Claude turn. We
+    // synthesize usage from pi's cumulative session stats.
+    const emitTurnResult = (): void => {
+      const stats =
+        typeof s.getSessionStats === "function" ? s.getSessionStats() : undefined;
+      const synthesis = synthesizeUsageAndCost(stats, sessionStartMs, sessionModelId);
+      emitResult(state, synthesis, wireSessionId, runErrored, false);
+      turnResultsEmitted += 1;
+    };
+
     s.subscribe((event: AgentSessionEvent) => {
       if (event.type === "message_update" && event.assistantMessageEvent.type === "error") {
         runErrored = true;
@@ -322,8 +350,17 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
         permissionMode: opts.permissionMode ?? "default",
       }, gateOpen ? permissionAsk : undefined);
 
+      if (event.type === "agent_start") {
+        agentActive = true;
+        return;
+      }
       if (event.type === "agent_end") {
-        agentEnded = true;
+        // A retry (`willRetry`) keeps the same run going — do not treat it as a
+        // turn boundary. A final `agent_end` closes the run; emit the result.
+        if (!event.willRetry) {
+          agentActive = false;
+          emitTurnResult();
+        }
         if (sessionFile) {
           appendSessionEntry(sessionFile, {
             kind: "system",
@@ -353,11 +390,12 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   const ensureSession = (): Promise<void> => {
     if (!buildPromise) {
       buildPromise = (async () => {
-        const buildResult = await buildPiSession(opts, cwd, undefined);
+        const buildResult = await buildPiSession(opts, cwd, undefined, wireSessionId);
         if (!buildResult.ok) throw new Error(buildResult.error);
         const s = buildResult.value.session;
         session = s;
         sessionModelId = describeModelId(s);
+        sessionStartMs = Date.now();
         sessionFile = ensureHapiCompatibleSessionFile({
           cwd,
           sessionId: s.sessionId,
@@ -404,7 +442,16 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
               await session.prompt(text, streamBehavior ? { streamingBehavior: streamBehavior } : {});
             } catch (e) {
               runErrored = true;
-              agentEnded = true; // unblock the wait; final result reports the error
+              // A failed prompt may never fire `agent_end`; close the run and
+              // emit an error result so the turn isn't silently dropped.
+              agentActive = false;
+              const stats =
+                session && typeof session.getSessionStats === "function"
+                  ? session.getSessionStats()
+                  : undefined;
+              const synthesis = synthesizeUsageAndCost(stats, sessionStartMs, sessionModelId);
+              emitResult(state, synthesis, wireSessionId, true, false);
+              turnResultsEmitted += 1; // count it so the trailing result isn't duplicated
               process.stderr.write(`pi-claude-shim: session failed: ${(e as Error).message}\n`);
             }
           })();
@@ -420,21 +467,18 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     stdinClosed = true;
   });
 
-  // 6. Wait for BOTH stdin close AND (no session built, or agent finished).
-  //    A probe sends no user message, so sessionBuilt stays false and we
-  //    resolve as soon as stdin closes — no 90s stall.
+  // 6. Keep the process alive until T3 closes stdin AND no turn is running.
+  //    There is deliberately NO arbitrary lifetime cap: a real Claude Code
+  //    process lives as long as its stdin is open, and a single turn can run
+  //    far past 90s when it drives background subagents (which arrive as
+  //    follow-up runs). T3 tears the session down by closing stdin.
   await new Promise<void>((resolve) => {
     const interval = setInterval(() => {
-      if (stdinClosed && (!sessionBuilt || agentEnded)) {
+      if (stdinClosed && (!sessionBuilt || !agentActive)) {
         clearInterval(interval);
         resolve();
       }
     }, 25);
-    const timer = setTimeout(() => {
-      clearInterval(interval);
-      resolve();
-    }, 90_000);
-    void timer;
     // Resolve immediately if stdin is already closed and nothing to do.
     if (stdinClosed && !sessionBuilt) {
       clearInterval(interval);
@@ -442,15 +486,18 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     }
   });
 
-  // 7. Synthesis + final `result` (zeros if no session was ever built).
-  //    Cast to sidestep TS narrowing the closure-mutated `session` to `never`.
+  // 7. Final `result`. Every completed turn already emitted its own result
+  //    (step 4), so only fill the gap: a probe (session never built) or a run
+  //    that reached stdin-close without a completed `agent_end`.
   const sRef = session as AgentSession | null;
   const stats =
     sRef && typeof sRef.getSessionStats === "function"
       ? sRef.getSessionStats()
       : undefined;
-  const synthesis = synthesizeUsageAndCost(stats, state.emitter.startedAtMs, sessionModelId);
-  emitResult(state, synthesis, wireSessionId, runErrored, false);
+  if (turnResultsEmitted === 0) {
+    const synthesis = synthesizeUsageAndCost(stats, state.emitter.startedAtMs, sessionModelId);
+    emitResult(state, synthesis, wireSessionId, runErrored, false);
+  }
 
   // 8. Cleanup.
   rl.close();
@@ -462,19 +509,6 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
 function writeBuildError(msg: string): number {
   process.stderr.write(`pi-claude-shim: ${msg}\n`);
   return 1;
-}
-
-/**
- * Wait for both stdin to close AND the agent to be idle. We exit after
- * whichever happens later — in practice, hapi closes stdin to signal
- * "no more messages", and we wait for any in-flight turn to finish.
- */
-async function waitForStreamJsonCompletion(session: AgentSession): Promise<void> {
-  // Naïve loop: poll isStreaming. The Claude SDK agent terminates when
-  // the parent writes a close, so we also accept stdin EOF as a finish
-  // trigger via the rl.on("close") above; the agent may still be busy
-  // running the last prompt. We bridge the two with a single waiter.
-  await waitForAgentSettle(session);
 }
 
 async function waitForAgentSettle(session: AgentSession): Promise<void> {
@@ -500,6 +534,7 @@ async function buildPiSession(
   opts: ClaudeShimOptions,
   cwd: string,
   noTools: "all" | "builtin" | undefined,
+  wireSessionId: string,
 ): Promise<Result<SessionRuntime>> {
   let settingsManager;
   try {
@@ -527,10 +562,17 @@ async function buildPiSession(
   const loader = new DefaultResourceLoader(loaderOptions);
   await loader.reload();
 
+  // The wire session id (what the host reported in `init.session_id`) MUST
+  // equal pi's on-disk session id, or `--resume <wireId>` can never find the
+  // session the host remembers. pi mints its own uuid otherwise, so we pass
+  // the wire id through as the session id whenever we create one.
+  const newSessionOptions = { id: wireSessionId };
+
   const sessionManager = await (async () => {
     if (opts.resume) {
-      // Resolve the specific session id to its file, then open it. Fall
-      // back to a fresh session if the id is not found.
+      // Resolve the specific session id to its file, then open it. The host
+      // passes the wire id as `--resume`, which now matches pi's id. Fall
+      // back to a fresh session (with the wire id) if the id is not found.
       try {
         const infos = await SessionManager.list(cwd);
         const match = infos.find((info) => info.id === opts.resume);
@@ -538,16 +580,16 @@ async function buildPiSession(
       } catch {
         // fall through to a fresh session
       }
-      return SessionManager.create(cwd);
+      return SessionManager.create(cwd, undefined, newSessionOptions);
     }
     if (opts.continueConversation) {
       try {
         return SessionManager.continueRecent(cwd);
       } catch {
-        return SessionManager.create(cwd);
+        return SessionManager.create(cwd, undefined, newSessionOptions);
       }
     }
-    return SessionManager.create(cwd);
+    return SessionManager.create(cwd, undefined, newSessionOptions);
   })();
 
   const allowed = opts.allowedTools

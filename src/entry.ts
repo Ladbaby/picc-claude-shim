@@ -40,6 +40,7 @@ import {
   type PendingPermission,
   type TranslatorState,
   createTranslatorState,
+  emitCompactBoundary,
   emitControlRequest,
   emitResult,
   emitSystemInit,
@@ -233,6 +234,24 @@ async function runPrintMode(opts: ClaudeShimOptions, cwd: string): Promise<numbe
 // stream-json mode: bidirectional NDJSON with pi
 // =====================================================================
 
+/**
+ * Recognize a host-side `/compact` invocation. T3 Code sends the slash
+ * command as a plain user message (exactly the text `/compact`, or
+ * `/compact <custom instructions>`), mirroring how real Claude Code's host
+ * SDK delivers it. Returns `null` when the message is NOT a compact command
+ * (so it is forwarded to pi as an ordinary prompt), otherwise the trimmed
+ * custom instructions (or `undefined` for a bare `/compact`).
+ */
+export function parseCompactCommand(text: string): string | undefined | null {
+  const trimmed = text.trim();
+  if (trimmed === "/compact") return undefined;
+  if (trimmed.startsWith("/compact ")) {
+    const rest = trimmed.slice("/compact ".length).trim();
+    return rest.length > 0 ? rest : undefined;
+  }
+  return null;
+}
+
 async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<number> {
   // The wire-level session id. Precedence:
   //   1. `opts.resume` — on resume the host re-sends the previous wire id and
@@ -296,6 +315,14 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   let buildPromise: Promise<void> | null = null;
   let runErrored = false;
   let firstMessage = true;
+  /**
+   * True while a `/compact` is running. A compact is not a prompt: it must not
+   * be appended to the session transcript as a user turn (that would defeat
+   * the compaction), and two compacts can't run at once (pi's `compact()`
+   * aborts any in-flight run first, so a second call would interrupt the
+   * first).
+   */
+  let compactInFlight = false;
 
   const pending = new Map<string, PendingPermission>();
 
@@ -357,9 +384,14 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
       if (event.type === "agent_end") {
         // A retry (`willRetry`) keeps the same run going — do not treat it as a
         // turn boundary. A final `agent_end` closes the run; emit the result.
+        // While a `/compact` is in flight, pi's `compact()` aborts any in-flight
+        // run (firing an `agent_end`) before summarizing; that abort is not a
+        // completed turn, so skip the result — the compact emits its own.
         if (!event.willRetry) {
           agentActive = false;
-          emitTurnResult();
+          if (!compactInFlight) {
+            emitTurnResult();
+          }
         }
         if (sessionFile) {
           appendSessionEntry(sessionFile, {
@@ -408,6 +440,58 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     return buildPromise;
   };
 
+  // 4b. Handle a host-side `/compact`. T3 Code (and real Claude Code's host
+  //     SDK) deliver `/compact` as a plain user message; real Claude Code's
+  //     harness intercepts it, runs a real compaction, and emits a
+  //     `compact_boundary` system message plus a terminal `result`. pi does
+  //     NOT know about `/compact` — fed as a prompt it just gets answered as
+  //     prose and no compaction happens. So we intercept it here and drive
+  //     pi's own `session.compact()`, then emit the same messages the host
+  //     expects to settle the compaction.
+  const handleCompactCommand = async (customInstructions: string | undefined): Promise<void> => {
+    if (compactInFlight) return; // a compact already running; drop the duplicate
+    try {
+      await ensureSession();
+      if (!session) return;
+      compactInFlight = true; // guard the agent_end handler against the abort() inside compact()
+      try {
+        const result = await session.compact(customInstructions);
+        // The `compact_boundary` is what T3 reads to (a) render the "Context
+        // compacted" divider and (b) settle its compaction wait. `pre_tokens`
+        // comes from pi; `post_tokens` (estimatedTokensAfter) is a shim-added
+        // field T3 uses for the before→after token summary.
+        emitCompactBoundary(state, wireSessionId, {
+          trigger: "manual",
+          preTokens: result.tokensBefore,
+          postTokens: result.estimatedTokensAfter,
+        });
+        // A terminal `result` so the `/compact` turn completes in the host
+        // (Claude Code always ends a submitMessage with one, even when it
+        // didn't call the model for the main conversation). No assistant text.
+        state.emitter.lastFlushedText = "";
+        const stats =
+          typeof session.getSessionStats === "function" ? session.getSessionStats() : undefined;
+        const synthesis = synthesizeUsageAndCost(stats, sessionStartMs, sessionModelId);
+        emitResult(state, synthesis, wireSessionId, false, false);
+        turnResultsEmitted += 1;
+      } catch (e) {
+        // "Nothing to compact (session too small)" / "Already compacted" /
+        // LLM error. Emit an error result so the turn isn't silently dropped.
+        const stats =
+          typeof session.getSessionStats === "function" ? session.getSessionStats() : undefined;
+        const synthesis = synthesizeUsageAndCost(stats, sessionStartMs, sessionModelId);
+        emitResult(state, synthesis, wireSessionId, true, false);
+        turnResultsEmitted += 1;
+        process.stderr.write(`pi-claude-shim: compact failed: ${(e as Error).message}\n`);
+      } finally {
+        compactInFlight = false;
+      }
+    } catch (e) {
+      compactInFlight = false;
+      process.stderr.write(`pi-claude-shim: compact setup failed: ${(e as Error).message}\n`);
+    }
+  };
+
   // 5. Read NDJSON from stdin.
   const rl = createInterface({ input: process.stdin });
   rl.on("line", (line) => {
@@ -425,6 +509,14 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
           }
         },
         onUserMessage: (text: string) => {
+          // Host-side `/compact`: run a real pi compaction and emit the
+          // compact_boundary + result the host settles on — do NOT forward it
+          // to pi as a prompt (that would be answered as prose, not compact).
+          const compactInstructions = parseCompactCommand(text);
+          if (compactInstructions !== null) {
+            void handleCompactCommand(compactInstructions);
+            return;
+          }
           // Kick off the (one-time) pi session build, then prompt. The probe
           // never reaches here, so this ~30s cost is paid only for real runs.
           void (async () => {

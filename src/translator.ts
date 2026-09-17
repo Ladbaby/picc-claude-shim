@@ -81,6 +81,37 @@ export interface SDKSystemStatus {
 
 export type SDKSystemMessage = SDKSystemInit | SDKSystemStatus | { type: "system"; subtype: string; [k: string]: unknown };
 
+/**
+ * A `system` message marking a context-compaction boundary. Mirrors Claude
+ * Code's `SDKCompactBoundaryMessageSchema` (`coreSchemas.ts`):
+ * `{type, subtype:"compact_boundary", session_id, uuid, compact_metadata}`
+ * where `compact_metadata` is `{trigger, pre_tokens, preserved_segment?}`.
+ *
+ * Note: real Claude Code does NOT emit a `post_tokens` field; the host (T3
+ * Code) learns the post-compact token count from a `compact_metadata.post_tokens`
+ * OR falls back to its synthesized "Context compacted" divider. We emit
+ * `post_tokens` anyway so T3's `compactBoundaryTokenUsageSnapshot` can build a
+ * real before→after token summary ("Compacted context N → M tokens").
+ */
+export interface SDKCompactBoundaryMessage {
+  type: "system";
+  subtype: "compact_boundary";
+  session_id: string;
+  uuid: string;
+  compact_metadata: {
+    trigger: "manual" | "auto";
+    pre_tokens: number;
+    /** Optional extra field T3 reads (not in Claude Code's schema, but harmless). */
+    post_tokens?: number;
+    preserved_segment?: {
+      head_uuid: string;
+      anchor_uuid: string;
+      tail_uuid: string;
+    };
+  };
+}
+
+
 export interface SDKAssistantMessage {
   type: "assistant";
   parent_tool_use_id?: string | null;
@@ -190,6 +221,7 @@ export interface SDKStreamEvent {
 
 export type SDKMessageOut =
   | SDKSystemMessage
+  | SDKCompactBoundaryMessage
   | SDKAssistantMessage
   | SDKUserMessage
   | SDKResultMessage
@@ -968,6 +1000,39 @@ export function emitResult(
     parent_tool_use_id: null,
   };
   state.emitter.emit(result);
+}
+
+/**
+ * Emit a `system` / `compact_boundary` message. Real Claude Code emits one of
+ * these when the conversation is compacted (`/compact` or auto-compaction); the
+ * host (T3 Code) reads it to render the "Context compacted" divider and to
+ * settle its compaction wait.
+ *
+ * We always include `post_tokens` so T3's `compactBoundaryTokenUsageSnapshot`
+ * builds a real before→after token summary (`post_tokens` is not in Claude
+ * Code's schema, but it's a superset field T3 explicitly reads; harmless for
+ * consumers that ignore it).
+ */
+export function emitCompactBoundary(
+  state: TranslatorState,
+  sessionId: string,
+  opts: { preTokens: number; postTokens?: number; trigger?: "manual" | "auto" },
+): void {
+  const meta: SDKCompactBoundaryMessage["compact_metadata"] = {
+    trigger: opts.trigger ?? "manual",
+    pre_tokens: opts.preTokens,
+  };
+  if (typeof opts.postTokens === "number" && Number.isFinite(opts.postTokens) && opts.postTokens > 0) {
+    meta.post_tokens = opts.postTokens;
+  }
+  const msg: SDKCompactBoundaryMessage = {
+    type: "system",
+    subtype: "compact_boundary",
+    session_id: sessionId,
+    uuid: randomUUID(),
+    compact_metadata: meta,
+  };
+  state.emitter.emit(msg);
 }
 
 /**

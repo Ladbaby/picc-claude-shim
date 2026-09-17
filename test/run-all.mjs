@@ -22,6 +22,7 @@ const tests = [
   "translator-out.test.ts",
   "structured-output.test.ts",
   "session-resume.test.ts",
+  "compact.test.ts",
 ];
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });

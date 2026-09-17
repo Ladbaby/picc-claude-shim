@@ -559,6 +559,17 @@ async function buildPiSession(
     const ap = opts.appendSystemPrompt;
     loaderOptions.appendSystemPromptOverride = (base) => [...base, ap];
   }
+  // T3 / headless path: pi only fires `session_start` from `bindExtensions`,
+  // which the shim never calls (it builds the session via `createAgentSession`
+  // directly). So the picc-permission-modes extension's `onSessionStart`
+  // (where it would learn the permission mode from a flag) never runs, and its
+  // gate would stay on "default" — auto-rejecting every non-allow tool call
+  // even when the host selected "Full access". The extension's register
+  // function DOES run during `loader.reload()` below, so we hand it the mode
+  // through an env var that it reads at register time.
+  if (opts.permissionMode) {
+    process.env.PICC_PERMISSION_MODE = opts.permissionMode;
+  }
   const loader = new DefaultResourceLoader(loaderOptions);
   await loader.reload();
 

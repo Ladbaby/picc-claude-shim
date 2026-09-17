@@ -23,6 +23,7 @@ const tests = [
   "structured-output.test.ts",
   "session-resume.test.ts",
   "compact.test.ts",
+  "skills.test.ts",
 ];
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });

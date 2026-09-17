@@ -52,6 +52,7 @@ import {
 import { fromClaudeToolName } from "./tool-names.js";
 import { synthesizeUsageAndCost } from "./cost.js";
 import { extractStructuredOutput } from "./structured-output.js";
+import { resolveSkillExpansion } from "./skills.js";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import { CLAUDE_CODE_VERSION_LINE } from "./version.js";
@@ -492,6 +493,31 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     }
   };
 
+  /**
+   * Expand a `/<skill>` turn into the prompt Claude Code would send, or `null`
+   * when `text` is not an invocation of a discovered claude skill.
+   *
+   * Real Claude Code intercepts a leading `/name` and expands it from the
+   * SKILL.md body (Base-directory prefix + argument substitution). T3 rewrites
+   * a `$skill` mention into exactly that text and sends it as an ordinary turn;
+   * without this, pi would answer `/skill …` as prose. Only the LAST text block
+   * can be a skill invocation (earlier `/…` are prose), and leading whitespace
+   * is not an invocation — mirroring both Claude Code and T3's dispatch.
+   */
+  const expandSkillTurn = async (text: string): Promise<string | null> => {
+    const lastBlock = text.split("\n\n").pop()?.trim() ?? text;
+    if (!lastBlock.startsWith("/")) return null;
+    const firstLine = lastBlock.split("\n", 1)[0];
+    if (!firstLine.startsWith("/")) return null;
+    const space = firstLine.indexOf(" ");
+    const name = space === -1 ? firstLine.slice(1) : firstLine.slice(1, space);
+    const args = space === -1 ? "" : firstLine.slice(space + 1);
+    if (!name) return null;
+    // Never treat the built-in control command as a skill.
+    if (name === "compact") return null;
+    return (await resolveSkillExpansion(cwd, name, args, session?.sessionId ?? "")) ?? null;
+  };
+
   // 5. Read NDJSON from stdin.
   const rl = createInterface({ input: process.stdin });
   rl.on("line", (line) => {
@@ -523,6 +549,10 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
             try {
               await ensureSession();
               if (!session || !sessionFile) return;
+              // A `/<skill>` turn is expanded into the prompt Claude Code would
+              // have sent (SKILL.md body + args). The transcript still records
+              // the raw `text` the user typed — Claude Code does the same.
+              const promptText = (await expandSkillTurn(text)) ?? text;
               appendSessionEntry(sessionFile, {
                 kind: "user",
                 message: { role: "user", content: text },
@@ -531,7 +561,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
               });
               const streamBehavior = firstMessage ? undefined : ("followUp" as const);
               firstMessage = false;
-              await session.prompt(text, streamBehavior ? { streamingBehavior: streamBehavior } : {});
+              await session.prompt(promptText, streamBehavior ? { streamingBehavior: streamBehavior } : {});
             } catch (e) {
               runErrored = true;
               // A failed prompt may never fire `agent_end`; close the run and

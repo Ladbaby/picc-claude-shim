@@ -1,6 +1,6 @@
 {
   "name": "@ladbabynpm/picc-claude-shim",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Drop-in replacement for Claude Code CLI. Speaks Claude Code's NDJSON protocol (--output-format stream-json / --input-format stream-json / --permission-prompt-tool stdio) so that third-party tools like hapi can drive pi instead of Claude Code. Internally creates a pi AgentSession and translates events. Local filesystem only.",
   "type": "module",
   "keywords": [
@@ -15,14 +15,19 @@
     "stream-json"
   ],
   "license": "MIT",
+  "author": "ladbabynpm",
   "files": [
     "src/",
     "bin/",
     "test/",
     "package.json",
     "tsconfig.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"

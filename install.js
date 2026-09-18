@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 /**
- * Postinstall helper for pi-claude-shim.
+ * Postinstall helper for picc-claude-shim.
  *
- * Registers the extension in `~/.pi/agent/settings.json#packages`
- * (idempotently) and writes `claude.cmd` (and the POSIX `claude`
- * entry) into a directory on the user's PATH so `claude` is
- * auto-discoverable by `hapi`.
+ * Runs automatically on `pi install npm:@ladbabynpm/picc-claude-shim` (and a
+ * plain `npm install`). It writes the `claude.cmd` / `claude` / `claude.exe`
+ * entry wrappers into a directory on the user's PATH so a host that spawns
+ * `claude` (hapi, T3 Code, the Claude Agent SDK) discovers the shim.
  *
- * Run manually any time with `node install.js` to (re-)write the
- * binary wrappers.
+ * When installed via pi, pi has already recorded `npm:@ladbabynpm/picc-claude-
+ * shim` in settings.json#packages and loads the `pi.extensions` manifest, so
+ * no local registration is performed. In a source checkout (or with
+ * `--register-local`) it still registers the local extension path.
+ *
+ * Run manually any time with `node install.js` to (re-)write the binary
+ * wrappers.
  */
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -21,8 +26,21 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const SHIM_ROOT = __dirname;
-const AGENT_DIR = process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+// Match pi's own `getAgentDir()`: the env var is `PI_CODING_AGENT_DIR` (derived
+// from `APP_NAME.toUpperCase() + "_CODING_AGENT_DIR"` in pi's config), defaulting
+// to `~/.pi/agent`.
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
+// pi installs npm packages under `<agentDir>/npm/node_modules/<name>` (global) or
+// `.pi/npm/node_modules/<name>` (project). When we live there, pi already recorded
+// `npm:@ladbabynpm/picc-claude-shim` in settings.json#packages and auto-loads our
+// `pi.extensions` manifest — so no local registration is needed.
+const PKG_NAME = "@ladbabynpm/picc-claude-shim";
+
+function isPiManagedInstall() {
+  const norm = SHIM_ROOT.replace(/\\/g, "/");
+  return norm.includes("npm/node_modules/" + PKG_NAME);
+}
 
 function log(...args) {
   process.stderr.write("[pi-claude-shim/install] " + args.join(" ") + "\n");
@@ -58,6 +76,15 @@ function main() {
 }
 
 function registerExtension() {
+  // When installed via `pi install npm:...`, pi has ALREADY written
+  // `npm:@ladbabynpm/picc-claude-shim` into settings.json#packages and loads our
+  // `pi.extensions` manifest on its own. Re-adding a local
+  // `extensions/pi-claude-shim` path here would be a dangling entry (that path
+  // only exists in the source checkout), so skip it.
+  if (isPiManagedInstall() && !process.argv.includes("--register-local")) {
+    log("pi-managed install — settings.json registration left to pi; skipping.");
+    return;
+  }
   if (!existsSync(SETTINGS_PATH)) {
     log(`settings.json not found at ${SETTINGS_PATH} — skipping registration.`);
     return;

@@ -24,31 +24,25 @@ runtime. `--version` prints `1.0.37 (Claude Code)` — the version the shim impe
 
 ## Install
 
-Run once:
+Install as a pi package — one command does the whole job:
 
 ```bash
-node install.js
+pi install npm:@ladbabynpm/picc-claude-shim
 ```
 
-This:
+`pi install` runs `npm install`, which fires the package's `postinstall` hook (`install.js`). That
+hook writes the `claude.cmd` (Windows), `claude` (POSIX; skipped on Windows unless
+`PI_SHIM_POSIX=1`), and `claude.exe` (Windows, only if one was built) entry wrappers into the first
+writable directory on PATH (`~/.local/bin`, then `~/bin`). These thin wrappers forward to
+`bin/claude.js`. This is the `claude` a host (hapi, T3 Code, the Claude Agent SDK) discovers via
+`which`/`where`.
 
-1. Adds `extensions/pi-claude-shim` to `~/.pi/agent/settings.json#packages` so pi auto-loads the
-   (no-op) extension factory — this is what makes the package discoverable to pi's package system.
-2. Writes `claude.cmd` (Windows), `claude` (POSIX; skipped on Windows unless `PI_SHIM_POSIX=1`),
-   and `claude.exe` (Windows, only if one was built) into the first writable directory on PATH
-   (`~/.local/bin`, then `~/bin`). These thin wrappers forward to `bin/claude.js`. This is the
-   `claude` a host discovers via `which`/`where`.
+pi also records `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and
+loads the `pi.extensions` manifest itself, so no manual registration is needed. Verify with:
 
-If a non-shim `claude`/`claude.cmd` already exists in the target directory, the install refuses to
-overwrite it unless you pass `--force`. The alternative is to point the host at the shim directly
-with `HAPI_CLAUDE_PATH=/full/path/to/bin/claude.cmd` (the path hapi's
-`cli/src/claude/sdk/utils.ts:145-200` already honors for Claude Code overrides).
-
-> `bin/claude.cmd` in the source tree is a **template** carrying a `__SHIM_BIN_PLACEHOLDER__` that
-> `install.js` fills with the real path when it writes the installed copy. Run the installed
-> `claude.cmd` (or the directly-runnable `bin/claude` / `bin/claude.js`), not the source template.
-> On Windows, the Claude Agent SDK spawns `claude.exe` without a shell; build it with
-> `node scripts/build-exe.mjs` before using the SDK.
+```bash
+claude --version
+```
 
 ## Flags
 
@@ -60,7 +54,7 @@ startup banner but do not fail the run.
 | `--output-format stream-json` / `--input-format stream-json` | Enable stream-json mode. |
 | `--output-format json` | Enable json (one-shot) mode. |
 | `--print <prompt>` / `-p` | Enable print mode. Bare `-p` reads the prompt from stdin. |
-| `--permission-prompt-tool stdio` | Accepted. The permission gate is in practice open for any non-`bypassPermissions` mode (see [Permission gate](#permission-gate)). |
+| `--permission-prompt-tool stdio` | Accepted. The permission gate is in practice open for any non-`bypassPermissions` mode. |
 | `--permission-mode <mode>` / `--dangerously-skip-permissions` | `bypassPermissions` closes the gate entirely; other modes are forwarded to `PICC_PERMISSION_MODE` for `@ladbabynpm/picc-permission-modes`. |
 | `--system-prompt <text>` | Replace the pi system prompt. |
 | `--append-system-prompt <text>` | Append to the pi system prompt. |
@@ -126,7 +120,7 @@ node test/run-e2e.mjs
 picc-claude-shim/
 ├── package.json         # @ladbabynpm/picc-claude-shim; jiti dep, pi peer deps
 ├── tsconfig.json
-├── install.js           # registers extension, writes claude.cmd/claude/claude.exe
+├── install.js           # postinstall: writes claude.cmd/claude/claude.exe (registers locally when not pi-managed)
 ├── README.md
 ├── scripts/
 │   ├── build-exe.mjs    # build native claude.exe (Claude Agent SDK spawn path on Windows)
@@ -136,7 +130,7 @@ picc-claude-shim/
 │   ├── claude.cmd       # Windows entry template (install.js fills in the path)
 │   ├── claude           # POSIX entry
 │   ├── claude.exe       # native entry (built by scripts/build-exe.mjs)
-│   └── entry-slow.mjs
+│   └── entry-slow.mjs   # jiti loader; aliases pi-coding-agent to pi's install
 ├── src/
 │   ├── index.ts         # no-op extension factory; registers --claude-shim-install flag
 │   ├── entry.ts         # orchestrator: args → pi session → protocol loop (all modes)

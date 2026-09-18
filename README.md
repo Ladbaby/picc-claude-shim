@@ -1,118 +1,97 @@
-# pi-claude-shim
+# picc-claude-shim
 
-Drop-in replacement for [Claude Code](https://github.com/anthropics/claude-code)'s
-CLI, powered by [pi](https://github.com/earendil-works/pi). Lets third-party
-tools that spawn `claude` — specifically
-[hapi](https://github.com/tiann/hapi) — drive a pi session with zero changes.
+[![npm downloads](https://img.shields.io/npm/dt/@ladbabynpm/picc-claude-shim.svg)](https://www.npmjs.com/package/@ladbabynpm/picc-claude-shim)
 
-## What this is
+Drop-in replacement for the Claude Code CLI, by disguising [pi](https://github.com/earendil-works/pi) as Claude Code.
+Part of [picc](https://github.com/Ladbaby/picc), a pi agent setup mirroring Claude Code's harness.
+Softwares built upon Claude Code, like [hapi](https://github.com/tiann/hapi) and [T3 Code](https://github.com/pingdotgg/t3code), can directly replace Claude Code with pi.
 
-`hapi` spawns the Claude Code CLI as a subprocess and exchanges JSON-lines over
-stdin/stdout. It builds `claude` command-line arguments from
-`hapi/cli/src/claude/sdk/query.ts:280-365` and reads `claude`'s output as
-NDJSON. The protocol:
+The shim parses the Claude-flavored CLI flags, creates a pi `AgentSession`, and translates bidirectionally between pi session events and Claude Code's  `stream-json` wire protocol (`system`/`assistant`/`result`/`control_request`/`control_response`).
+It also mirrors each turn into a Claude/hapi-compatible session JSONL and reports a Claude-style version, so hosts that probe `claude --version` or scan `~/.claude/projects/**/<session-id>.jsonl` see exactly what they would see against a real Claude Code install.
 
-```
-claude --output-format stream-json --input-format stream-json --verbose \
-       [--permission-prompt-tool stdio] [--system-prompt X] [--resume ID] ...
-```
+## Modes
 
-Emits messages like:
+| Mode | Invocation | Purpose |
+|------|------------|---------|
+| `stream-json` | `--output-format stream-json --input-format stream-json` | The primary host target. Bidirectional NDJSON over stdin/stdout; speaks the Claude Code SDK protocol and bridges a live pi session. |
+| `json` | `--output-format json` | One-shot single-JSON-object output. With `--json-schema <schema>` emits `{"structured_output": <value>}` (t3code's commit/PR/title text-generation parser); without, emits a single Claude `result` message. Prompt arrives inline or on stdin. |
+| `print` | `--print <prompt>` (or bare `-p`) | One-shot text output. Streams the assistant's final text to stdout and exits 0. Used for quick smoke tests. |
+| local (TTY) | (default, no JSON flags) | **Not supported.** Emits an explicit error and exits 1 — pi's interactive TUI uses Ink and would conflict with a host's terminal handling. |
 
-```
-{type:"system",    subtype:"init",  session_id, model, cwd, tools, slash_commands}
-{type:"assistant", message:{role:"assistant", content:[{type:"text"|"tool_use",...}]}}
-{type:"result",    subtype, usage, total_cost_usd, duration_ms, session_id}
-{type:"control_request",  request_id, request:{subtype:"can_use_tool", tool_name, input}}
-{type:"control_response", response: {request_id, subtype, response:{behavior:"allow"|"deny"}}}
-```
-
-This extension adds a `claude` binary entry script that **translates between
-the Claude Code NDJSON protocol and pi's session events** so that hapi works
-unchanged against pi.
+`--version` and `--help` are answered by a fast JS path (`bin/claude.js`) without loading the pi
+runtime. `--version` prints `1.0.37 (Claude Code)` — the version the shim impersonates
+(`src/version.js`), so host version checks pass.
 
 ## Install
 
 Run once:
 
 ```bash
-cd ~/.pi/agent/extensions/pi-claude-shim
 node install.js
 ```
 
 This:
-1. Adds `extensions/pi-claude-shim` to `~/.pi/agent/settings.json#packages`
-   so pi auto-loads the extension factory.
-2. Writes `~/.local/bin/claude.cmd` (POSIX `claude`) — a thin wrapper that
-   forwards to `bin/claude.js`. This is the entry that hapi spawns.
 
-If a real `claude.cmd` already exists, the install refuses to overwrite
-unless you pass `--force`. The alternative is to set
-`HAPI_CLAUDE_PATH=/full/path/to/pi-claude-shim/bin/claude.cmd` (the path
-hapi's `cli/src/claude/sdk/utils.ts:145-200` already honors for Claude Code
-overrides).
+1. Adds `extensions/pi-claude-shim` to `~/.pi/agent/settings.json#packages` so pi auto-loads the
+   (no-op) extension factory — this is what makes the package discoverable to pi's package system.
+2. Writes `claude.cmd` (Windows), `claude` (POSIX; skipped on Windows unless `PI_SHIM_POSIX=1`),
+   and `claude.exe` (Windows, only if one was built) into the first writable directory on PATH
+   (`~/.local/bin`, then `~/bin`). These thin wrappers forward to `bin/claude.js`. This is the
+   `claude` a host discovers via `which`/`where`.
 
-Note: `bin/claude.cmd` in the source tree is a **template** — it carries a
-`__SHIM_BIN_PLACEHOLDER__` that `install.js` replaces with the real path when
-it writes the installed copy. The directly-runnable entries are the POSIX
-`bin/claude` and `bin/claude.js`; run those (or the installed `claude.cmd`)
-rather than the source-tree template.
+If a non-shim `claude`/`claude.cmd` already exists in the target directory, the install refuses to
+overwrite it unless you pass `--force`. The alternative is to point the host at the shim directly
+with `HAPI_CLAUDE_PATH=/full/path/to/bin/claude.cmd` (the path hapi's
+`cli/src/claude/sdk/utils.ts:145-200` already honors for Claude Code overrides).
 
-## How hapi drives the shim
+> `bin/claude.cmd` in the source tree is a **template** carrying a `__SHIM_BIN_PLACEHOLDER__` that
+> `install.js` fills with the real path when it writes the installed copy. Run the installed
+> `claude.cmd` (or the directly-runnable `bin/claude` / `bin/claude.js`), not the source template.
+> On Windows, the Claude Agent SDK spawns `claude.exe` without a shell; build it with
+> `node scripts/build-exe.mjs` before using the SDK.
 
-When you run `hapi` against a session, hapi invokes `claudeRemote` which
-spawns the configured `claude` binary as a subprocess. With this shim
-installed, the binary is the shim, which:
+## Flags
 
-1. Parses Claude-flavored flags (`--output-format stream-json`,
-   `--permission-prompt-tool stdio`, `--system-prompt`, etc.).
-2. Creates a pi `AgentSession` via `createAgentSession()`.
-3. Subscribes to pi events, accumulates partial content into a
-   content-block buffer, and flushes `assistant.content` blocks on
-   `message_end`.
-4. Writes `system/init` (with session_id, model, cwd, tools).
-5. Writes a hapi-compatible session JSONL at
-   `$CLAUDE_CONFIG_DIR/projects/<sanitized-cwd>/<session-id>.jsonl`
-   so hapi's `claudeCheckSession` (`cli/src/claude/utils/claudeCheckSession.ts`)
-   observes the file.
-6. Reads NDJSON from stdin. `user` messages feed `session.prompt()`;
-   `control_response` resolves outstanding permission gates.
-7. Mirrors each user/assistant message into the JSONL with a UUID for
-   hapi's session scanner.
-8. On `agent_end` (and stdin close), computes usage synthesis from
-   `session.getSessionStats()` and emits a final `result` message.
-9. Exits 0.
+Parsed by `parseClaudeArgs` (`src/args.ts`). Unrecognized flags are collected and reported on the
+startup banner but do not fail the run.
 
-## Verified end-to-end
+| Flag | Effect |
+|------|--------|
+| `--output-format stream-json` / `--input-format stream-json` | Enable stream-json mode. |
+| `--output-format json` | Enable json (one-shot) mode. |
+| `--print <prompt>` / `-p` | Enable print mode. Bare `-p` reads the prompt from stdin. |
+| `--permission-prompt-tool stdio` | Accepted. The permission gate is in practice open for any non-`bypassPermissions` mode (see [Permission gate](#permission-gate)). |
+| `--permission-mode <mode>` / `--dangerously-skip-permissions` | `bypassPermissions` closes the gate entirely; other modes are forwarded to `PICC_PERMISSION_MODE` for `@ladbabynpm/picc-permission-modes`. |
+| `--system-prompt <text>` | Replace the pi system prompt. |
+| `--append-system-prompt <text>` | Append to the pi system prompt. |
+| `--resume <id>` | Open the existing pi session with that id (falls back to a fresh session if not found). |
+| `--continue` | Continue the most recent pi session in the cwd. |
+| `--allowed-tools <list>` / `--disallowed-tools <list>` | Allow/deny tools, mapped through the tool-name table below. |
+| `--model <id>` | Parsed, surfaced in `system/init` until the real pi model is known. See [Known limitations](#known-limitations). |
+| `--max-turns <n>` | Parsed but not enforced. |
+| `--include-partial-messages` | When set, the translator emits partial assistant message updates. |
+| `--json-schema <schema>` | (json mode only) Emit `{"structured_output": <value>}` decoded against the schema. |
 
-```
-$ node bin/claude.js --output-format stream-json --input-format stream-json --verbose << 'EOF'
-{"type":"user","message":{"role":"user","content":"say lol"}}
-EOF
+### Tool name mapping
 
-{"type":"system","subtype":"init","session_id":"019f8d49-...","model":"Tresor/claude-sonnet",...}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"lol 😂"}]}}
-{"type":"result","subtype":"success","result":"lol 😂","num_turns":1,
- "usage":{"input_tokens":1,"output_tokens":3,"cache_read_input_tokens":9243,...},
- "total_cost_usd":0,"duration_ms":2926,...}
-```
+Mappings in `src/tool-names.ts` are **case-insensitive in both directions** to match picc's
+registered tool names, which may be lowercase (`read`, `bash`, `grep`) or PascalCase (`Read`,
+`Edit`, `Glob`). pi `find` maps to Claude `Glob` (picc-glob accepts both `Glob` and `find`); the
+other built-ins map identity-modulo-case. Unknown tools (TodoWrite, WebSearch, etc.) have no pi
+equivalent — if a tool-call gate asks permission for one, the shim replies with
+`control_response{behavior:"deny"}`.
 
-## Scope
+| pi (canonical) | Claude wire name |
+|----------------|------------------|
+| `read` | `Read` |
+| `write` | `Write` |
+| `edit` | `Edit` |
+| `bash` | `Bash` |
+| `grep` | `Grep` |
+| `find` | `Glob` |
+| `ls` | `LS` |
 
-- ✅ Remote mode (`--output-format stream-json --input-format stream-json`)
-- ✅ Tool permission negotiation (`--permission-prompt-tool stdio`)
-- ✅ System prompt replace and append (`--system-prompt`, `--append-system-prompt`)
-- ✅ Resume / continue (`--resume`, `--continue`)
-- ✅ Allowed / disallowed tools, model, permission-mode flags
-- ✅ Hapi-compatible session JSONL at `<projectDir>/<session-id>.jsonl`
-- ✅ One-shot `--print <prompt>` mode for quick smoke tests
-- ❌ Local (TTY-attached) mode — out of scope; emits an explicit error
-- ❌ Hooks (`--settings` SessionStart) — not invoked; rely on `system/init` + JSONL
-- ❌ `--model` flag is parsed but not yet honored (pi's model selection is
-       based on `~/.pi/agent/settings.json` defaults)
-- ❌ `--max-turns` is parsed but not enforced
-
-## Tested behavior
+## Testing
 
 Run the unit tests:
 
@@ -121,16 +100,21 @@ node test/run-all.mjs
 ```
 
 Tests cover:
+
 - `args.test.ts` — flag parsing (`--output-format`, `--permission-prompt-tool`, etc.)
-- `tool-names.test.ts` — Claude/Anthropic ↔ pi tool name mapping (case-insensitive)
+- `tool-names.test.ts` — pi ↔ Claude tool name mapping (case-insensitive)
 - `session-jsonl.test.ts` — hapi JSONL writer
+- `session-resume.test.ts` — resume id resolution
 - `cost.test.ts` — usage + cost synthesis
 - `permission-gate.test.ts` — when the permission gate is open/closed
 - `translator.test.ts` — stdin → pi calls
 - `translator-out.test.ts` — pi events → Claude NDJSON (result fields, control_request)
+- `compact.test.ts` — `/compact` parsing and interception
+- `skills.test.ts` — skill discovery + expansion
+- `structured-output.test.ts` — `--json-schema` value extraction
 
-`entry.e2e.test.ts` is a separate, live-backend test (needs a configured pi
-model + API key) and is not part of `run-all.mjs`. Run it with:
+`entry.e2e.test.ts` is a separate live-backend test (needs a configured pi model + API key) and is
+not part of `run-all.mjs`. Run it with:
 
 ```bash
 node test/run-e2e.mjs
@@ -139,86 +123,55 @@ node test/run-e2e.mjs
 ## Files
 
 ```
-extensions/pi-claude-shim/
-├── package.json         # @earendil-works/pi-coding-agent + jiti deps
+picc-claude-shim/
+├── package.json         # @ladbabynpm/picc-claude-shim; jiti dep, pi peer deps
 ├── tsconfig.json
-├── install.js           # postinstall — registers extension, writes claude.cmd
+├── install.js           # registers extension, writes claude.cmd/claude/claude.exe
 ├── README.md
+├── scripts/
+│   ├── build-exe.mjs    # build native claude.exe (Claude Agent SDK spawn path on Windows)
+│   └── claude_launcher.c
 ├── bin/
-│   ├── claude.js        # Node entry; imports src/entry.ts via jiti
+│   ├── claude.js        # Node entry; --version/--help fast path, else imports src/entry.ts via jiti
 │   ├── claude.cmd       # Windows entry template (install.js fills in the path)
-│   └── claude           # POSIX entry
+│   ├── claude           # POSIX entry
+│   ├── claude.exe       # native entry (built by scripts/build-exe.mjs)
+│   └── entry-slow.mjs
 ├── src/
-│   ├── index.ts         # Extension factory (no-op; registers --claude-shim-install flag)
-│   ├── entry.ts         # Orchestrator: args → pi session → protocol loop
+│   ├── index.ts         # no-op extension factory; registers --claude-shim-install flag
+│   ├── entry.ts         # orchestrator: args → pi session → protocol loop (all modes)
 │   ├── args.ts          # parseClaudeArgs — Claude-flavored argv parser
 │   ├── translator.ts    # bi-directional event/message translation
 │   ├── session-jsonl.ts # hapi-compatible session JSONL writer
-│   ├── tool-names.ts    # case-insensitive tool name mapping (find ↔ Glob, etc.)
-│   └── cost.ts          # synthesizeUsageAndCost from pi's SessionStats
-└── test/
-    ├── args.test.ts
-    ├── tool-names.test.ts
-    ├── session-jsonl.test.ts
-    ├── cost.test.ts
-    ├── permission-gate.test.ts
-    ├── translator.test.ts
-    ├── translator-out.test.ts
-    ├── entry.e2e.test.ts
-    ├── run-all.mjs      # Run all unit tests
-    └── run-e2e.mjs      # Run the e2e test specifically
+│   ├── tool-names.ts    # case-insensitive pi ↔ Claude tool name mapping
+│   ├── cost.ts          # synthesizeUsageAndCost from pi's SessionStats
+│   ├── skills.ts        # Claude skill discovery + expansion
+│   ├── structured-output.ts # --json-schema value extraction
+│   └── version.js       # version string the shim impersonates
+└── test/                # unit + e2e tests (see Testing)
 ```
-
-## Design choices
-
-- **Why an extension?** Pi already auto-discovers local extensions in
-  `~/.pi/agent/extensions/`. The shim lives there instead of being a
-  separate npm package because pi-version drift would otherwise break the
-  wire protocol.
-
-- **Why a separate `claude` binary rather than a `pi claude-shim` flag?**
-  hapi spawns a binary literally named `claude` via `which`/`where`
-  lookup. Pi has no API to alias itself as `claude`. The install script
-  drops a thin wrapper at `~/.local/bin/claude.cmd`.
-
-- **Tool name mapping:** the mapping is case-insensitive in both directions
-  to match picc's registered tool names, which may be lowercase (`read`,
-  `bash`, `grep`) or PascalCase (`Read`, `Edit`, `Glob`). pi's `find` maps to
-  Claude's `Glob` (picc-glob accepts both `Glob` and `find`); the other
-  built-ins map identity-modulo-case. Unknown tools (TodoWrite, WebSearch,
-  etc.) are not yet supported; if a tool-call gate asks permission for one,
-  the shim replies with `control_response{behavior:"deny"}`.
-
-- **Permission gate:** `control_request` round-trips happen only when the
-  parent passes `--permission-prompt-tool stdio` **and** the mode is not
-  `bypassPermissions`. Without the stdio flag the gate stays closed even in
-  a non-bypass permission mode, so a plain `claude` invocation never blocks
-  on a permission prompt.
-
-- **Thinking blocks:** emitted as `thinking` content blocks in the assistant
-  message. pi's `thinking_delta` events are accumulated and flushed on
-  `message_end`; Claude's protocol has a `thinking` block type, so they are
-  passed through rather than dropped.
-
-- **Cost & duration:** `total_cost_usd` is taken straight from pi's
-  `SessionStats.cost` (which pi calculates against the model's pricing).
-  `duration_api_ms` mirrors `duration_ms` because pi does not separate
-  the two at the per-session granularity Claude exposes — this is
-  marked as a known approximation in the plan.
-
-- **Why no Local mode?** pi's interactive TUI uses Ink and would conflict
-  with hapi's terminal handling. Surfacing an explicit error is more
-  discoverable than silent misbehaviour.
 
 ## Known limitations
 
-- The `--model` flag is parsed but the shim currently lets pi pick the
-  model from `settings.json#defaultModel`. Honoring arbitrary provider
-  IDs requires plumbing through pi's `ModelRuntime` registry.
-- `--max-turns` is parsed but not enforced. The pi session runs as many
-  turns as the agent decides; we may add a wrapper that aborts after N
-  in a follow-up.
-- Hook forwarder commands (the `hapi hook-forwarder` invocation Claude
-  Code itself does on SessionStart) are not triggered. hapi tolerates
-  this when `system/init` and the JSONL file are both present, but the
-  hook-based session-start notification is skipped.
+- `--model` is parsed and surfaced in `system/init` but does not select a model; pi picks from
+  `~/.pi/agent/settings.json#defaultModel`. Honoring arbitrary provider IDs requires plumbing
+  through pi's `ModelRuntime` registry.
+- `--max-turns` is parsed but not enforced; the session runs as many turns as the agent decides.
+- Hook forwarder commands (the `hapi hook-forwarder` invocation Claude Code runs on SessionStart)
+  are not triggered. Hosts tolerate this when `system/init` and the JSONL file are both present.
+
+## Differences from Claude Code
+
+These are intentionally out of scope for picc-claude-shim.
+
+- **No local (TTY) mode** — stream-json, json, and print only.
+- **No hooks** — `--settings` SessionStart hook forwarding is not invoked.
+- **No `--model` selection** — pi's default model is used.
+- **No `--max-turns` enforcement.**
+- **Skill inline bash** — Claude Code executes inline `` !`…` `` injections in a skill body before
+  sending; the shim forwards the substituted body as-is and lets pi's agent run such commands via
+  its own tools.
+- **No `.agents/skills` scan** — only the user and project `.claude/skills` roots Claude Code
+  verifies are scanned.
+- **No `--output-format stream-json` partial streaming** by default — set
+  `--include-partial-messages` to emit partial assistant updates.

@@ -382,18 +382,33 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
         agentActive = true;
         return;
       }
-      if (event.type === "agent_end") {
-        // A retry (`willRetry`) keeps the same run going — do not treat it as a
-        // turn boundary. A final `agent_end` closes the run; emit the result.
-        // While a `/compact` is in flight, pi's `compact()` aborts any in-flight
-        // run (firing an `agent_end`) before summarizing; that abort is not a
-        // completed turn, so skip the result — the compact emits its own.
-        if (!event.willRetry) {
-          agentActive = false;
-          if (!compactInFlight) {
-            emitTurnResult();
-          }
+      if (event.type === "compaction_end") {
+        // Pi can recover an overflow (the provider may have returned HTTP 400)
+        // by compacting and continuing the same prompt. Surface that boundary
+        // immediately, but never synthesize a Claude `result` for it: T3 Code
+        // treats a result as the terminal state of its active turn.
+        if (
+          event.reason !== "manual" &&
+          !event.aborted &&
+          event.result !== undefined
+        ) {
+          emitCompactBoundary(state, wireSessionId, {
+            trigger: "auto",
+            preTokens: event.result.tokensBefore,
+            postTokens: event.result.estimatedTokensAfter,
+          });
         }
+        return;
+      }
+      if (event.type === "agent_end") {
+        // Do not end the wire turn here. `agent_end` occurs before pi performs
+        // overflow recovery, so an HTTP 400 can be followed by automatic
+        // compaction and a continuation. `agent_settled` is pi's definitive
+        // signal that the prompt and every compact/retry have finished.
+        //
+        // A host-side `/compact` explicitly owns its result and aborts any
+        // running agent operation first, so keep that abort out of this turn.
+        if (compactInFlight) agentActive = false;
         if (sessionFile) {
           appendSessionEntry(sessionFile, {
             kind: "system",
@@ -401,6 +416,13 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
             sessionId: s.sessionId,
             cwd,
           });
+        }
+        return;
+      }
+      if (event.type === "agent_settled") {
+        if (agentActive && !compactInFlight) {
+          agentActive = false;
+          emitTurnResult();
         }
         return;
       }

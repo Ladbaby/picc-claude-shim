@@ -519,6 +519,8 @@ export interface PendingPermission {
 export interface InputContext {
   pendingPermissions: Map<string, PendingPermission>;
   onUserMessage: (text: string) => Promise<void> | void;
+  /** Abort the active agent turn when the SDK sends a control `interrupt`. */
+  onInterrupt?: () => Promise<void> | void;
   /**
    * Handle an incoming `control_request` from the SDK (e.g. `initialize`,
    * `get_usage`). The callback emits the matching `control_response`.
@@ -588,6 +590,7 @@ export function handleClaudeInput(
       const request = (m as { request?: { subtype?: string; [k: string]: unknown } }).request;
       const requestId = (m as { request_id?: string }).request_id;
       const subtype = request?.subtype;
+      if (subtype === "interrupt") void ctx.onInterrupt?.();
       if (request && subtype && requestId) {
         ctx.respondControlRequest?.(requestId, { ...request, subtype });
       }

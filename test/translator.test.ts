@@ -138,7 +138,30 @@ assertEq(userTextSeen, "world\n!!", "user array content joined");
   assertEq((r as { message?: string }).message, "cancelled by client", "cancel message");
 }
 
-// 6. malformed JSON returns null and does not throw.
+// 6. control_request interrupt -> invokes turn cancellation and still responds.
+{
+  let interrupts = 0;
+  let response: { requestId: string; subtype: string } | undefined;
+  handleClaudeInput(
+    JSON.stringify({
+      type: "control_request",
+      request_id: "interrupt_aaa",
+      request: { subtype: "interrupt" },
+    }),
+    {
+      pendingPermissions: pending,
+      onUserMessage: () => {},
+      onInterrupt: () => { interrupts++; },
+      respondControlRequest: (requestId, request) => {
+        response = { requestId, subtype: request.subtype };
+      },
+    },
+  );
+  assertEq(interrupts, 1, "interrupt invokes cancellation");
+  assertEq(JSON.stringify(response), JSON.stringify({ requestId: "interrupt_aaa", subtype: "interrupt" }), "interrupt receives response");
+}
+
+// 7. malformed JSON returns null and does not throw.
 {
   let thrown = false;
   try {
@@ -149,7 +172,7 @@ assertEq(userTextSeen, "world\n!!", "user array content joined");
   assertEq(thrown, false, "malformed JSON does not throw");
 }
 
-// 7. JSON without 'type' is ignored gracefully.
+// 8. JSON without 'type' is ignored gracefully.
 {
   let thrown = false;
   try {

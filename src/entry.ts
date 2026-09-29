@@ -326,6 +326,26 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   let compactInFlight = false;
 
   const pending = new Map<string, PendingPermission>();
+  let cancellationPromise: Promise<void> | null = null;
+  let cancellationRequested = false;
+
+  /**
+   * Stop the parent turn when the host interrupts it or tears down stdin.
+   * Aborting the parent session propagates its current tool AbortSignal to a
+   * foreground Agent subagent; session shutdown below aborts background agents.
+   */
+  const cancelActiveRun = (): Promise<void> => {
+    cancellationRequested = true;
+    if (cancellationPromise) return cancellationPromise;
+    for (const pendingPermission of pending.values()) {
+      pendingPermission.resolve({ behavior: "deny", message: "cancelled by client" });
+    }
+    pending.clear();
+    cancellationPromise = session?.abort().catch((error: unknown) => {
+      process.stderr.write(`pi-claude-shim: abort failed: ${String(error)}\n`);
+    }) ?? Promise.resolve();
+    return cancellationPromise;
+  };
 
   const permissionAsk = async (
     toolName: string,
@@ -556,7 +576,13 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
             );
           }
         },
+        onInterrupt: () => {
+          void cancelActiveRun();
+        },
         onUserMessage: (text: string) => {
+          // A later user turn after an interrupt is a fresh run.
+          cancellationRequested = false;
+          cancellationPromise = null;
           // Host-side `/compact`: run a real pi compaction and emit the
           // compact_boundary + result the host settles on — do NOT forward it
           // to pi as a prompt (that would be answered as prose, not compact).
@@ -570,7 +596,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
           void (async () => {
             try {
               await ensureSession();
-              if (!session || !sessionFile) return;
+              if (!session || !sessionFile || cancellationRequested) return;
               // A `/<skill>` turn is expanded into the prompt Claude Code would
               // have sent (SKILL.md body + args). The transcript still records
               // the raw `text` the user typed — Claude Code does the same.
@@ -609,6 +635,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   let stdinClosed = false;
   rl.on("close", () => {
     stdinClosed = true;
+    void cancelActiveRun();
   });
 
   // 6. Keep the process alive until T3 closes stdin AND no turn is running.
@@ -643,9 +670,17 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     emitResult(state, synthesis, wireSessionId, runErrored, false);
   }
 
-  // 8. Cleanup.
+  // 8. Cleanup. Tell extensions the session is ending before disposal so
+  // picc-subagents can abort background/queued agents via session_shutdown.
   rl.close();
-  if (sRef) sRef.dispose();
+  if (sRef) {
+    try {
+      await sRef.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
+    } catch {
+      // Best effort: session disposal still releases the parent operation.
+    }
+    sRef.dispose();
+  }
   void state;
   return 0;
 }

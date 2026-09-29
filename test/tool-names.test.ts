@@ -32,6 +32,8 @@ assertEq(toClaudeToolName("write"), "Write", "write -> Write");
 assertEq(toClaudeToolName("grep"), "Grep", "grep -> Grep");
 assertEq(toClaudeToolName("find"), "Glob", "find -> Glob");
 assertEq(toClaudeToolName("ls"), "LS", "ls -> LS");
+assertEq(toClaudeToolName("TaskUpdate"), "TaskUpdate", "TaskUpdate keeps Claude casing");
+assertEq(toClaudeToolName("AskUserQuestion"), "AskUserQuestion", "AskUserQuestion keeps Claude casing");
 
 // fromClaudeToolName: Claude wire name -> pi canonical, case-insensitive.
 assertEq(fromClaudeToolName("Bash"), "bash", "Bash -> bash");

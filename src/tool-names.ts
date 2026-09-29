@@ -56,20 +56,16 @@ const CLAUDE_TO_PI: Record<string, PiToolName> = Object.fromEntries(
   Object.entries(PI_TO_CLAUDE).map(([pi, claude]) => [claude.toLowerCase(), pi]),
 ) as Record<string, PiToolName>;
 
-function firstUpper(s: string): string {
-  return s.length === 0 ? s : s.charAt(0).toUpperCase() + s.slice(1);
-}
-
 /**
  * pi name → Claude/Anthropic wire name. Case-insensitive: `Read` and `read`
- * both map to `Read`. Unknown names are capitalized as a best effort so the
- * protocol always carries a plausible tool name.
+ * both map to `Read`. Unknown names retain their exact spelling: extension
+ * tools use Claude Code's camel/Pascal-case names (for example, `TaskUpdate`)
+ * and lowercasing would change the tool being invoked.
  */
 export function toClaudeToolName(piName: string): string {
   const canonical = PI_TO_CLAUDE[piName.toLowerCase() as PiToolName];
   if (canonical) return canonical;
-  // Fallback: unknown tool — capitalize for a plausible PascalCase name.
-  return firstUpper(piName.toLowerCase());
+  return piName;
 }
 
 /**

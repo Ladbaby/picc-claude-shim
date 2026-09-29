@@ -748,10 +748,10 @@ async function buildPiSession(
   })();
 
   const allowed = opts.allowedTools
-    .map((t) => fromClaudeToolName(t) ?? t.toLowerCase())
+    .map((t) => fromClaudeToolName(t) ?? t)
     .filter((t) => t.length > 0);
   const disallowed = opts.disallowedTools
-    .map((t) => fromClaudeToolName(t) ?? t.toLowerCase())
+    .map((t) => fromClaudeToolName(t) ?? t)
     .filter((t) => t.length > 0);
 
   void opts.model;

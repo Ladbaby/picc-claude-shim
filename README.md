@@ -74,7 +74,7 @@ itself, in this order (first match wins):
 2. the nearest `node_modules/@earendil-works/pi-coding-agent` walking up from the package.
 3. a global Bun root (`$BUN_INSTALL/install/global/node_modules`, `~/.bun/install/global/node_modules`) — bun-compiled hapi runners commonly live here.
 4. the global npm root (`npm root -g`).
-5. pi's managed roots (`~/.pi/agent/npm/node_modules`, `~/.pi/agent/node_modules`, `~/.pi/node_modules`).
+5. pi's managed install, resolved through `~/.pi/agent/install/current-version` to `~/.pi/agent/install/releases/<version>/node_modules`, then legacy pi-managed npm roots (`~/.pi/agent/npm/node_modules`, `~/.pi/agent/node_modules`, `~/.pi/node_modules`).
 
 If none are found, the shim prints a clear error showing the `PICC_CLAUDE_SHIM_PI_DIR` override.
 Set that variable in the environment of whatever process spawns `claude` (e.g. the hapi runner) to

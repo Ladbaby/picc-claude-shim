@@ -100,7 +100,7 @@ startup banner but do not fail the run.
 | `--append-system-prompt <text>` | Append to the pi system prompt. |
 | `--resume <id>` | Open the existing pi session with that id (falls back to a fresh session if not found). |
 | `--continue` | Continue the most recent pi session in the cwd. |
-| `--allowed-tools <list>` / `--disallowed-tools <list>` | Allow/deny tools, mapped through the tool-name table below. |
+| `--allowed-tools <list>` / `--disallowed-tools <list>` | Permission rules, not tool activation: `--allowed-tools` pre-approves matching tool names; `--disallowed-tools` removes matching pi tools. |
 | `--model <id>` | Parsed, surfaced in `system/init` until the real pi model is known. See [Known limitations](#known-limitations). |
 | `--max-turns <n>` | Parsed but not enforced. |
 | `--include-partial-messages` | When set, the translator emits partial assistant message updates. |

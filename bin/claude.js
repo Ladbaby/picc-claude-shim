@@ -22,6 +22,7 @@
  */
 
 import { getClaudeCodeVersion } from "../src/version.js";
+import { isCapabilityProbe, runCapabilityProbe } from "./capability-probe.mjs";
 
 const claudeCodeVersion = getClaudeCodeVersion();
 
@@ -69,15 +70,19 @@ if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
   process.exit(0);
 }
 
-// ---- Slow path: load the pi-backed orchestrator ----
-const { runClaudeShim } = await import("./entry-slow.mjs");
-runClaudeShim(process.argv.slice(2)).then(
-  (code) => {
-    process.exit(code ?? 0);
-  },
-  (err) => {
-    const msg = err instanceof Error ? err.stack || err.message : String(err);
-    process.stderr.write(`pi-claude-shim: fatal: ${msg}\n`);
-    process.exit(1);
-  },
-);
+if (isCapabilityProbe(argv)) {
+  runCapabilityProbe();
+} else {
+  // ---- Slow path: load the pi-backed orchestrator ----
+  const { runClaudeShim } = await import("./entry-slow.mjs");
+  runClaudeShim(process.argv.slice(2)).then(
+    (code) => {
+      process.exit(code ?? 0);
+    },
+    (err) => {
+      const msg = err instanceof Error ? err.stack || err.message : String(err);
+      process.stderr.write(`pi-claude-shim: fatal: ${msg}\n`);
+      process.exit(1);
+    },
+  );
+}

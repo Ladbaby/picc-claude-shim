@@ -19,6 +19,7 @@ import {
   launcherDirectory,
   runInstaller,
 } from "../installer-lib.mjs";
+import { isCapabilityProbe } from "../bin/capability-probe.mjs";
 import {
   FALLBACK_CLAUDE_CODE_VERSION,
   getClaudeCodeVersion,
@@ -58,6 +59,20 @@ await test("uses a stable launcher directory beneath the pi agent directory", ()
     launcherDirectory("C:/Users/Test/.pi/agent"),
     join("C:/Users/Test/.pi/agent", "extensions", EXTENSION_NAME, "bin"),
   );
+});
+
+await test("identifies T3's no-prompt capability probe without matching normal sessions", () => {
+  assert.equal(
+    isCapabilityProbe([
+      "--output-format", "stream-json",
+      "--input-format", "stream-json",
+      "--setting-sources=user,project,local",
+      "--strict-mcp-config",
+      "--no-session-persistence",
+    ]),
+    true,
+  );
+  assert.equal(isCapabilityProbe(["--output-format", "stream-json"]), false);
 });
 
 await test("fetches and persists the release version only during installation", async () => {

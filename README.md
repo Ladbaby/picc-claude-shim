@@ -35,13 +35,25 @@ Install as a pi package — one command does the whole job:
 pi install npm:@ladbabynpm/picc-claude-shim
 ```
 
-`pi install` runs `npm install`, which fires the package's `postinstall` hook (`install.js`). The
-hook creates a dedicated, deterministic launcher directory that does not collide with other
-software and never changes `PATH`:
+pi records `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and installs
+the package itself into its managed npm directory:
+
+```text
+~/.pi/agent/npm/node_modules/@ladbabynpm/picc-claude-shim/
+```
+
+pi loads the package's `pi.extensions` manifest directly from there, so no manual registration is
+needed. The package's `postinstall` hook (`install.js`) *additionally* materializes a
+dedicated, deterministic launcher directory that does not collide with other software and never
+changes `PATH`:
 
 ```text
 ~/.pi/agent/extensions/picc-claude-shim/bin/
 ```
+
+That directory is the recommended thing to point third-party applications at, because it is
+guaranteed to exist: if a package manager skips the `postinstall` hook, the shim recreates it on
+the first real (non-`--version`) invocation. Both locations are valid entry points.
 
 On Windows, configure third-party applications to execute:
 
@@ -53,8 +65,24 @@ The installer writes `picc-claude-shim-root.txt` beside the executable so the co
 launcher can resolve its npm-managed runtime after package upgrades. On POSIX systems, configure
 `~/.pi/agent/extensions/picc-claude-shim/bin/claude` instead.
 
-pi also records `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and
-loads the `pi.extensions` manifest itself, so no manual registration is needed.
+### Resolving the pi runtime
+
+The drop-in binary runs *outside* pi, so it locates the `@earendil-works/pi-coding-agent` install
+itself, in this order (first match wins):
+
+1. `PICC_CLAUDE_SHIM_PI_DIR` — explicit override to the pi-coding-agent directory (highest priority).
+2. the nearest `node_modules/@earendil-works/pi-coding-agent` walking up from the package.
+3. a global Bun root (`$BUN_INSTALL/install/global/node_modules`, `~/.bun/install/global/node_modules`) — bun-compiled hapi runners commonly live here.
+4. the global npm root (`npm root -g`).
+5. pi's managed roots (`~/.pi/agent/npm/node_modules`, `~/.pi/agent/node_modules`, `~/.pi/node_modules`).
+
+If none are found, the shim prints a clear error showing the `PICC_CLAUDE_SHIM_PI_DIR` override.
+Set that variable in the environment of whatever process spawns `claude` (e.g. the hapi runner) to
+point at your pi install:
+
+```bash
+PICC_CLAUDE_SHIM_PI_DIR=/path/to/node_modules/@earendil-works/pi-coding-agent
+```
 
 ## Flags
 

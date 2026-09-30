@@ -1,21 +1,19 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  EXTENSION_NAME,
   PACKAGE_NAME,
-  WRAPPER_MARKER,
+  SHIM_ROOT_FILE,
   isPiManagedInstall,
-  pickBinDir,
-  preflightWrapperTargets,
+  launcherDirectory,
   runInstaller,
 } from "../installer-lib.mjs";
 
@@ -45,96 +43,40 @@ test("detects only pi npm-managed installs", () => {
   assert.equal(isPiManagedInstall("C:/x/extensions/picc-claude-shim"), false);
 });
 
-test("chooses only a writable user bin directory already on PATH", () => {
-  withTempDir((dir) => {
-    const localBin = join(dir, ".local", "bin");
-    assert.equal(pickBinDir({ homeDir: dir, pathValue: join(dir, "unrelated") }), null);
-    assert.equal(pickBinDir({ homeDir: dir, pathValue: localBin }), localBin);
-    assert.equal(existsSync(localBin), true);
-  });
+test("uses a stable launcher directory beneath the pi agent directory", () => {
+  assert.equal(
+    launcherDirectory("C:/Users/Test/.pi/agent"),
+    join("C:/Users/Test/.pi/agent", "extensions", EXTENSION_NAME, "bin"),
+  );
 });
 
-test("rejects non-picc wrapper collisions", () => {
+test("installs Windows launcher and package-root sidecar without PATH", () => {
   withTempDir((dir) => {
-    const target = join(dir, "claude.cmd");
-    writeFileSync(target, "@echo off\nREM Another Claude wrapper\n");
-    const logs = [];
-    assert.equal(
-      preflightWrapperTargets({ cmd: target, posix: join(dir, "claude"), exe: join(dir, "claude.exe") }, {
-        log: (...parts) => logs.push(parts.join(" ")),
-      }),
-      false,
-    );
-    assert.match(logs.join("\n"), /non-picc Claude wrapper/);
-  });
-});
-
-test("accepts and updates picc-owned wrappers", () => {
-  withTempDir((dir) => {
-    const target = join(dir, "claude.cmd");
-    writeFileSync(target, `@echo off\nREM ${WRAPPER_MARKER}\n`);
-    assert.equal(
-      preflightWrapperTargets({ cmd: target, posix: join(dir, "claude"), exe: join(dir, "claude.exe") }),
-      true,
-    );
-  });
-});
-
-test("accepts legacy picc wrappers for an in-place upgrade", () => {
-  withTempDir((dir) => {
-    const target = join(dir, "claude.cmd");
-    writeFileSync(target, "@echo off\nREM pi-claude-shim legacy wrapper\n");
-    assert.equal(
-      preflightWrapperTargets({ cmd: target, posix: join(dir, "claude"), exe: join(dir, "claude.exe") }),
-      true,
-    );
-  });
-});
-
-test("writes marked wrappers and registers the correct local extension", () => {
-  withTempDir((dir) => {
-    const localBin = join(dir, ".local", "bin");
     const agentDir = join(dir, "agent");
-    const settingsPath = join(agentDir, "settings.json");
-    const logs = [];
-    mkdirSync(agentDir, { recursive: true });
-    writeFileSync(settingsPath, JSON.stringify({ packages: [] }));
-
-    const result = runInstaller({
-      args: ["--register-local"],
-      shimRoot: SHIM_ROOT,
-      agentDir,
-      homeDir: dir,
-      pathValue: localBin,
-      platform: "linux",
-      log: (...parts) => logs.push(parts.join(" ")),
-    });
-
-    assert.equal(result, true);
-    assert.match(readFileSync(join(localBin, "claude.cmd"), "utf8"), new RegExp(WRAPPER_MARKER));
-    assert.match(readFileSync(join(localBin, "claude"), "utf8"), new RegExp(WRAPPER_MARKER));
-    assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")).packages, ["extensions/picc-claude-shim"]);
-    assert.match(logs.join("\n"), /installed claude\.cmd/);
-  });
-});
-
-test("does not crash when settings packages is malformed", () => {
-  withTempDir((dir) => {
-    const localBin = join(dir, ".local", "bin");
-    const agentDir = join(dir, "agent");
-    mkdirSync(agentDir, { recursive: true });
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: "bad" }));
     const logs = [];
 
     assert.equal(runInstaller({
-      args: ["--register-local"],
       shimRoot: SHIM_ROOT,
       agentDir,
-      homeDir: dir,
-      pathValue: localBin,
-      platform: "linux",
+      platform: "win32",
       log: (...parts) => logs.push(parts.join(" ")),
     }), true);
-    assert.match(logs.join("\n"), /packages is not an array/);
+
+    const targetDir = launcherDirectory(agentDir);
+    assert.equal(existsSync(join(targetDir, "claude.exe")), true);
+    assert.equal(readFileSync(join(targetDir, SHIM_ROOT_FILE), "utf8"), `${resolve(SHIM_ROOT)}\n`);
+    assert.match(logs.join("\n"), /Windows launcher installed/);
+    assert.match(logs.join("\n"), /no PATH changes were made/);
+  });
+});
+
+test("installs a POSIX launcher without PATH", () => {
+  withTempDir((dir) => {
+    const agentDir = join(dir, "agent");
+
+    assert.equal(runInstaller({ shimRoot: SHIM_ROOT, agentDir, platform: "linux" }), true);
+    const launcher = readFileSync(join(launcherDirectory(agentDir), "claude"), "utf8");
+    assert.match(launcher, /exec node/);
+    assert.match(launcher, /claude\.js/);
   });
 });

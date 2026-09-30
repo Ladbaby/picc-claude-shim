@@ -35,6 +35,7 @@
 #define PICC_NODE_EXE ""
 #endif
 #define PICC_WRAPPER_MARKER "picc-claude-shim-wrapper:v1"
+#define PICC_SHIM_ROOT_FILE "picc-claude-shim-root.txt"
 
 static const char *SHIM_ROOT = PICC_SHIM_ROOT;
 static const char *NODE_EXE = PICC_NODE_EXE;
@@ -63,6 +64,39 @@ static char *join_shim_bin(const char *root) {
   return out;
 }
 
+/* Strip the final path component: <launcher>/claude.exe -> <launcher>. */
+static char *launcher_dir_from_exe(const char *exe_path) {
+  char *dir = strdup(exe_path);
+  if (!dir) return NULL;
+  char *s = strrchr(dir, '\\');
+  if (s) *s = '\0'; else { s = strrchr(dir, '/'); if (s) *s = '\0'; }
+  return dir;
+}
+
+/* Read the package root sidecar next to an installed launcher. */
+static char *shim_root_from_sidecar(const char *exe_path) {
+  char *dir = launcher_dir_from_exe(exe_path);
+  if (!dir) return NULL;
+  size_t n = strlen(dir) + strlen("/" PICC_SHIM_ROOT_FILE) + 1;
+  char *sidecar = (char *)malloc(n);
+  if (!sidecar) { free(dir); return NULL; }
+  snprintf(sidecar, n, "%s/%s", dir, PICC_SHIM_ROOT_FILE);
+  free(dir);
+
+  FILE *f = fopen(sidecar, "rb");
+  free(sidecar);
+  if (!f) return NULL;
+  char buf[MAX_PATH * 4];
+  if (!fgets(buf, sizeof(buf), f)) { fclose(f); return NULL; }
+  fclose(f);
+  buf[strcspn(buf, "\\r\\n")] = '\0';
+  if (!*buf) return NULL;
+  char *bin = join_shim_bin(buf);
+  bool ok = bin && file_exists(bin);
+  free(bin);
+  return ok ? strdup(buf) : NULL;
+}
+
 /* Strip the final two path components: <shim>/bin/claude.exe -> <shim>. */
 static char *shim_root_from_exe(const char *exe_path) {
   char *dir = strdup(exe_path);
@@ -81,6 +115,10 @@ static char *resolve_shim_root(const char *exe_path) {
     char *b = join_shim_bin(env);
     if (b && file_exists(b)) { free(b); return strdup(env); }
     free(b);
+  }
+  if (exe_path) {
+    char *root = shim_root_from_sidecar(exe_path);
+    if (root) return root;
   }
   if (exe_path) {
     char *root = shim_root_from_exe(exe_path);

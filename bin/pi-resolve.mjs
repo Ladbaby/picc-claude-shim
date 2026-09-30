@@ -17,7 +17,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,28 @@ function bunGlobalRoots(env) {
 }
 
 /**
+ * Pi's managed installer stores the runtime in a versioned release directory:
+ *
+ *   <agentDir>/install/current-version
+ *   <agentDir>/install/releases/<version>/node_modules/<PI_PKG>
+ *
+ * The `current-version` indirection is deliberate: pi updates atomically switch
+ * releases and the launcher resolves the version at runtime. Read it rather
+ * than guessing a release number. Invalid/missing files are ignored so this
+ * remains only one candidate source among several.
+ */
+export function managedPiPkgDir(agentDir) {
+  try {
+    const installDir = join(agentDir, "install");
+    const version = readFileSync(join(installDir, "current-version"), "utf8").trim();
+    if (!/^[0-9A-Za-z._+-]+$/.test(version)) return null;
+    return join(installDir, "releases", version, "node_modules", PI_PKG);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Ordered list of candidate directories that might contain the pi runtime.
  * Not yet validated — callers filter with {@link looksLikePiPkgDir}.
  *
@@ -84,8 +106,14 @@ function bunGlobalRoots(env) {
  * @param {NodeJS.ProcessEnv} [options.env] process env (defaults to `process.env`)
  * @param {string} [options.selfDir] directory of the caller (defaults to this file)
  * @param {string|null} [options.npmGlobalRoot] pre-resolved `npm root -g` (avoids a subprocess)
+ * @param {boolean} [options.includeNpmGlobal] whether to probe `npm root -g` when no root is supplied
  */
-export function candidatePiPkgDirs({ env = process.env, selfDir, npmGlobalRoot: providedNpmRoot } = {}) {
+export function candidatePiPkgDirs({
+  env = process.env,
+  selfDir,
+  npmGlobalRoot: providedNpmRoot,
+  includeNpmGlobal = true,
+} = {}) {
   // `fileURLToPath` (not `URL.pathname`) so the default is a real filesystem
   // path on every platform — `pathname` yields `/C:/...` on Windows, which
   // would break the "nearest local install" walk.
@@ -107,15 +135,19 @@ export function candidatePiPkgDirs({ env = process.env, selfDir, npmGlobalRoot: 
   // 3. Bun global roots (bun-compiled hapi runners commonly live here).
   for (const root of bunGlobalRoots(env)) add(join(root, PI_PKG));
 
-  // 4. npm global root (only subprocesses when no explicit override/root given).
-  if (!providedNpmRoot) {
-    add(join(npmGlobalRoot() ?? "", PI_PKG));
-  } else {
+  // 4. npm global root. The opt-out supports hermetic tests and callers that
+  // already know a local/managed pi location; normal runtime resolution keeps
+  // the established global-npm fallback.
+  if (providedNpmRoot) {
     add(join(providedNpmRoot, PI_PKG));
+  } else if (includeNpmGlobal) {
+    add(join(npmGlobalRoot() ?? "", PI_PKG));
   }
 
-  // 5. pi's own managed roots (covers pi installed into the agent's npm root).
-  // Honor `env.HOME` so callers can keep the candidate list hermetic in tests.
+  // 5. pi's managed runtime locations.
+  // The normal managed installer places pi in `install/releases/<current>`;
+  // npm/node_modules locations cover alternative/manual installs.
+  add(managedPiPkgDir(agentDir));
   add(join(agentDir, "npm", "node_modules", PI_PKG));
   add(join(agentDir, "node_modules", PI_PKG));
   add(join(home, ".pi", "node_modules", PI_PKG));
@@ -129,8 +161,8 @@ export function candidatePiPkgDirs({ env = process.env, selfDir, npmGlobalRoot: 
  *
  * @returns {string|null} absolute pi-coding-agent directory, or null
  */
-export function resolvePiPkgDir({ env = process.env, selfDir } = {}) {
-  for (const dir of candidatePiPkgDirs({ env, selfDir })) {
+export function resolvePiPkgDir({ env = process.env, selfDir, includeNpmGlobal = true } = {}) {
+  for (const dir of candidatePiPkgDirs({ env, selfDir, includeNpmGlobal })) {
     if (looksLikePiPkgDir(dir)) return dir;
   }
   return null;

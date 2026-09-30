@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   candidatePiPkgDirs,
   looksLikePiPkgDir,
+  managedPiPkgDir,
   resolvePiPkgDir,
 } from "../bin/pi-resolve.mjs";
 import { ensureLauncher, launcherDirectory } from "../installer-lib.mjs";
@@ -96,6 +97,44 @@ await test("resolvePiPkgDir prefers a local node_modules install over a bun glob
 
     const found = resolvePiPkgDir({ env: hermeticEnv(dir), selfDir });
     assert.equal(found, localPi);
+  });
+});
+
+await test("resolvePiPkgDir finds pi's active managed release", async () => {
+  await withTempDir(async (dir) => {
+    const agentDir = join(dir, "agent");
+    const version = "0.99.1";
+    const managedPi = join(
+      agentDir,
+      "install",
+      "releases",
+      version,
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+    );
+    mkdirSync(join(agentDir, "install"), { recursive: true });
+    writeFileSync(join(agentDir, "install", "current-version"), `${version}\n`, "utf8");
+    makeFakePiPkg(managedPi);
+
+    assert.equal(managedPiPkgDir(agentDir), managedPi);
+    assert.equal(
+      resolvePiPkgDir({
+        env: hermeticEnv(dir),
+        selfDir: dir,
+        includeNpmGlobal: false,
+      }),
+      managedPi,
+    );
+  });
+});
+
+await test("managedPiPkgDir ignores unsafe release identifiers", async () => {
+  await withTempDir(async (dir) => {
+    const agentDir = join(dir, "agent");
+    mkdirSync(join(agentDir, "install"), { recursive: true });
+    writeFileSync(join(agentDir, "install", "current-version"), "../../unexpected\n", "utf8");
+    assert.equal(managedPiPkgDir(agentDir), null);
   });
 });
 

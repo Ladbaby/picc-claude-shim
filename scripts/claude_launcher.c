@@ -89,7 +89,7 @@ static char *shim_root_from_sidecar(const char *exe_path) {
   char buf[MAX_PATH * 4];
   if (!fgets(buf, sizeof(buf), f)) { fclose(f); return NULL; }
   fclose(f);
-  buf[strcspn(buf, "\\r\\n")] = '\0';
+  buf[strcspn(buf, "\r\n")] = '\0';
   if (!*buf) return NULL;
   char *bin = join_shim_bin(buf);
   bool ok = bin && file_exists(bin);

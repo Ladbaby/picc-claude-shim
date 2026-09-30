@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
+  copyFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -67,6 +70,16 @@ test("installs Windows launcher and package-root sidecar without PATH", () => {
     assert.equal(readFileSync(join(targetDir, SHIM_ROOT_FILE), "utf8"), `${resolve(SHIM_ROOT)}\n`);
     assert.match(logs.join("\n"), /Windows launcher installed/);
     assert.match(logs.join("\n"), /no PATH changes were made/);
+  });
+});
+
+test("runs a copied Windows launcher through its root sidecar", () => {
+  if (process.platform !== "win32") return;
+  withTempDir((dir) => {
+    const launcher = join(dir, "claude.exe");
+    copyFileSync(join(SHIM_ROOT, "bin", "claude.exe"), launcher);
+    writeFileSync(join(dir, SHIM_ROOT_FILE), `${resolve(SHIM_ROOT)}\n`, "utf8");
+    assert.equal(execFileSync(launcher, ["--version"], { encoding: "utf8" }).trim(), "1.0.37 (Claude Code)");
   });
 });
 

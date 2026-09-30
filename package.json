@@ -1,6 +1,6 @@
 {
   "name": "@ladbabynpm/picc-claude-shim",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Drop-in replacement for Claude Code CLI. Speaks Claude Code's NDJSON protocol (--output-format stream-json / --input-format stream-json / --permission-prompt-tool stdio) so that third-party tools like hapi can drive pi instead of Claude Code. Internally creates a pi AgentSession and translates events. Local filesystem only.",
   "type": "module",
   "keywords": [

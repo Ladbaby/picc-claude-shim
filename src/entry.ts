@@ -55,6 +55,7 @@ import { extractStructuredOutput } from "./structured-output.js";
 import { resolveSkillExpansion } from "./skills.js";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { getClaudeCodeVersion } from "./version.js";
 
 const PI_VERSION = `${getClaudeCodeVersion()} (Claude Code)`;
@@ -275,6 +276,15 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   // `set_permission_mode` requests are acknowledged on the control channel;
   // pi cannot safely replace this session's extension configuration mid-run.
   const gateOpen = computeGateOpen(opts.permissionPromptTool, opts.permissionMode);
+  // Claude Code's --allowedTools is a pre-approval rule list. Keep this
+  // separate from pi's active-tool selection, which is handled when the
+  // session is constructed below.
+  const allowedToolNames = new Set(
+    opts.allowedTools
+      .map((name) => fromClaudeToolName(name) ?? name)
+      .filter((name) => name.length > 0)
+      .map((name) => name.toLowerCase()),
+  );
 
   // 2. Translator state (stdout emitter + buffers). Eager — needed to emit
   //    init and to answer control_requests as they arrive.
@@ -356,6 +366,12 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     | { behavior: "allow"; updatedInput?: Record<string, unknown> }
     | { behavior: "deny"; message: string }
   > => {
+    // Claude Code treats --allowedTools as pre-approved permission rules,
+    // not as an activation allow-list. Match it before going to the host's
+    // canUseTool callback. Full command-pattern matching is intentionally
+    // deferred; exact tool-name rules are the safe common denominator and
+    // cover hapi's MCP title tool plus normal SDK use.
+    if (allowedToolNames.has(toolName.toLowerCase())) return { behavior: "allow" };
     if (!gateOpen) return { behavior: "allow" };
     const requestId = emitControlRequest(state, toolName, input, toolCallId);
     return new Promise((resolve) => {
@@ -479,6 +495,9 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
         });
         wireSessionEvents(s);
         sessionBuilt = true;
+        process.stderr.write(
+          `pi-claude-shim: pi session ready with tools: ${listActiveToolsLowercase(s).join(", ") || "(none)"}\n`,
+        );
       })();
     }
     return buildPromise;
@@ -716,9 +735,15 @@ async function buildPiSession(
   noTools: "all" | "builtin" | undefined,
   wireSessionId: string,
 ): Promise<Result<SessionRuntime>> {
+  const agentDir = getAgentDir();
   let settingsManager;
   try {
-    settingsManager = SettingsManager.create(cwd);
+    // Keep SettingsManager and DefaultResourceLoader on the same explicit
+    // agent directory. Calling `SettingsManager.create(cwd)` alone lets it
+    // derive a different global-config root from the spawned host's env,
+    // which leaves packages/extensions (and therefore registered tools) out
+    // of a headless shim session.
+    settingsManager = SettingsManager.create(cwd, agentDir);
   } catch (e) {
     return {
       ok: false,
@@ -728,7 +753,7 @@ async function buildPiSession(
 
   const loaderOptions: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
     cwd,
-    agentDir: getAgentDir(),
+    agentDir,
     settingsManager,
   };
   if (opts.systemPrompt !== undefined) {
@@ -783,9 +808,6 @@ async function buildPiSession(
     return SessionManager.create(cwd, undefined, newSessionOptions);
   })();
 
-  const allowed = opts.allowedTools
-    .map((t) => fromClaudeToolName(t) ?? t)
-    .filter((t) => t.length > 0);
   const disallowed = opts.disallowedTools
     .map((t) => fromClaudeToolName(t) ?? t)
     .filter((t) => t.length > 0);
@@ -795,7 +817,10 @@ async function buildPiSession(
   void effortToThinkingLevel(opts.effort);
 
   try {
-    const modelRuntime = await ModelRuntime.create();
+    const modelRuntime = await ModelRuntime.create({
+      authPath: join(agentDir, "auth.json"),
+      modelsPath: join(agentDir, "models.json"),
+    });
     const createOpts: Parameters<typeof createAgentSession>[0] = {
       cwd,
       settingsManager,
@@ -805,7 +830,6 @@ async function buildPiSession(
       thinkingLevel: effortToThinkingLevel(opts.effort),
     };
     if (noTools) createOpts.noTools = noTools;
-    if (allowed.length > 0) createOpts.tools = allowed;
     if (disallowed.length > 0) createOpts.excludeTools = disallowed;
 
     const { session } = await createAgentSession(createOpts);

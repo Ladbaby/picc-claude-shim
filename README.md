@@ -19,8 +19,10 @@ It also mirrors each turn into a Claude/hapi-compatible session JSONL and report
 | local (TTY) | (default, no JSON flags) | **Not supported.** Emits an explicit error and exits 1 — pi's interactive TUI uses Ink and would conflict with a host's terminal handling. |
 
 `--version` and `--help` are answered by a fast JS path (`bin/claude.js`) without loading the pi
-runtime. `--version` prints `1.0.37 (Claude Code)` — the version the shim impersonates
-(`src/version.js`), so host version checks pass.
+runtime. At package installation, the shim fetches the latest official Claude Code GitHub release
+once and caches its version. That cached version is used by `--version`, the startup banner,
+`system/init`, and session JSONL metadata. Normal shim invocations never refresh it; a failed
+install-time fetch preserves an existing cache or falls back to the bundled version.
 
 ## Install
 

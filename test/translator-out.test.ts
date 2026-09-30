@@ -307,6 +307,16 @@ assertEq(
   assertEq(typeof usagePayload.rate_limits.five_hour.resets_at === "number", true, "usage five_hour resets_at");
   assertEq(typeof usagePayload.rate_limits.seven_day.resets_at === "number", true, "usage seven_day resets_at");
 
+  const permissionPayload = buildControlResponsePayload({
+    subtype: "set_permission_mode",
+    mode: "plan",
+  });
+  assertEq(
+    JSON.stringify(permissionPayload),
+    JSON.stringify({ mode: "plan" }),
+    "set_permission_mode echoes applied mode",
+  );
+
   // Unknown subtypes resolve to an empty success payload (never throw).
   assertEq(JSON.stringify(buildControlResponsePayload({ subtype: "set_model" })), "{}", "unknown subtype -> {}");
 }

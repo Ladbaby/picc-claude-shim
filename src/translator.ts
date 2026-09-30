@@ -1150,6 +1150,13 @@ export function buildControlResponsePayload(
         behaviors: null,
       };
     }
+    case "set_permission_mode": {
+      // The current SDK accepts a successful acknowledgement, but newer hosts
+      // may inspect the acknowledgement payload. Echo the applied mode, as
+      // Claude Code does, and persist it on TranslatorState for observability.
+      const mode = typeof request.mode === "string" ? request.mode : "default";
+      return { mode };
+    }
     default:
       // Unknown / unsupported control_request subtypes: empty success so the
       // SDK does not block. The SDK ignores a null response for subtypes it

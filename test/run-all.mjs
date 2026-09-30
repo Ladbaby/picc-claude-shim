@@ -25,6 +25,7 @@ const tests = [
   "compact.test.ts",
   "skills.test.ts",
   "installer.test.mjs",
+  "pi-resolve.test.mjs",
 ];
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });

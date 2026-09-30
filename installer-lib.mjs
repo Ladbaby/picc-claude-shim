@@ -80,6 +80,57 @@ function writeWindowsLauncher(targetDir, shimRoot) {
   writeFileSync(join(targetDir, SHIM_ROOT_FILE), `${resolve(shimRoot)}\n`, "utf8");
 }
 
+function ensureLauncherFilesForPlatform(targetDir, extensionDir, shimRoot, platform) {
+  if (sameDirectory(extensionDir, shimRoot)) {
+    // Source checkout / junction: the package's own `bin/` already holds the
+    // launcher, so there is nothing extra to create.
+    const launcher = platform === "win32"
+      ? join(targetDir, "claude.exe")
+      : join(targetDir, "claude");
+    if (!existsSync(launcher)) {
+      throw new Error(`source launcher not found at ${launcher}`);
+    }
+    return `launcher already available: ${launcher}`;
+  }
+  if (platform === "win32") {
+    writeWindowsLauncher(targetDir, shimRoot);
+    return `Windows launcher installed: ${join(targetDir, "claude.exe")}`;
+  }
+  writePosixLauncher(join(targetDir, "claude"), shimRoot);
+  return `POSIX launcher installed: ${join(targetDir, "claude")}`;
+}
+
+/**
+ * Best-effort, network-free launcher self-heal.
+ *
+ * pi installs an npm package under `~/.pi/agent/npm/node_modules/...` — it
+ * does NOT create `~/.pi/agent/extensions/picc-claude-shim/`. That directory
+ * only exists if this package's `postinstall` hook ran (which it may not,
+ * depending on the package manager / install path). To keep the documented
+ * launcher path guaranteed regardless, we (re)create it here on demand.
+ *
+ * Unlike {@link runInstaller} this performs NO network work and swallows
+ * every error, so it can run on the shim's first slow-path invocation
+ * without ever delaying or failing a session. Returns `true` only when a
+ * launcher file is now present in the deterministic directory.
+ */
+export function ensureLauncher({
+  shimRoot = DEFAULT_SHIM_ROOT,
+  agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  platform = process.platform,
+} = {}) {
+  const extensionDir = join(agentDir, "extensions", EXTENSION_NAME);
+  const targetDir = launcherDirectory(agentDir);
+  const launcherName = platform === "win32" ? "claude.exe" : "claude";
+  try {
+    mkdirSync(targetDir, { recursive: true });
+    ensureLauncherFilesForPlatform(targetDir, extensionDir, shimRoot, platform);
+    return existsSync(join(targetDir, launcherName));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Install a deterministic, explicitly-configurable launcher in pi's extension
  * directory. Nothing is placed on PATH and no third-party application files
@@ -98,22 +149,7 @@ export async function runInstaller({
 
   try {
     mkdirSync(targetDir, { recursive: true });
-
-    if (sameDirectory(extensionDir, shimRoot)) {
-      const launcher = platform === "win32"
-        ? join(targetDir, "claude.exe")
-        : join(targetDir, "claude");
-      if (!existsSync(launcher)) {
-        throw new Error(`source launcher not found at ${launcher}`);
-      }
-      log(`launcher already available: ${launcher}`);
-    } else if (platform === "win32") {
-      writeWindowsLauncher(targetDir, shimRoot);
-      log(`Windows launcher installed: ${join(targetDir, "claude.exe")}`);
-    } else {
-      writePosixLauncher(join(targetDir, "claude"), shimRoot);
-      log(`POSIX launcher installed: ${join(targetDir, "claude")}`);
-    }
+    log(ensureLauncherFilesForPlatform(targetDir, extensionDir, shimRoot, platform));
 
     try {
       const version = await refreshClaudeCodeVersion({ cacheDir: extensionDir, fetchImpl });

@@ -200,7 +200,32 @@ assertEq(
   assertEq(JSON.stringify(types), JSON.stringify(["text", "tool_use", "thinking"]), "buffer flushes all three blocks");
 }
 
-// 5. num_turns increments per turn_end and is reported in result.
+// 5. A completed pi execution becomes a Claude user/tool_result. hapi uses
+// the matching tool_use_id (not the top-level result message) to stop its
+// tool-card timer and spinner.
+{
+  col.lines = [];
+  handleAgentEvent(state, {
+    type: "tool_execution_end",
+    toolCallId: "toolu_bash",
+    toolName: "bash",
+    result: { content: [{ type: "text", text: "hello\n" }] },
+    isError: false,
+  } as never, {} as never);
+  const toolResult = col.messages()[0] as {
+    type: string;
+    message: { role: string; content: Array<Record<string, unknown>> };
+    session_id?: string;
+  };
+  assertEq(toolResult.type, "user", "tool execution emits a user message");
+  assertEq(toolResult.message.content[0]?.type, "tool_result", "tool execution emits tool_result");
+  assertEq(toolResult.message.content[0]?.tool_use_id, "toolu_bash", "tool result matches call id");
+  assertEq(toolResult.message.content[0]?.content, "hello\n", "tool result contains output");
+  assertEq(toolResult.message.content[0]?.is_error, false, "tool result success status");
+  assertEq(toolResult.session_id, "session-1", "tool result session id");
+}
+
+// 6. num_turns increments per turn_end and is reported in result.
 col.lines = [];
 for (let i = 0; i < 3; i++) handleAgentEvent(state, { type: "turn_end" } as never, {} as never);
 assertEq(state.numTurns, 3, "num_turns counts turn_end");

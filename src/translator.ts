@@ -144,6 +144,8 @@ export interface SDKUserMessage {
     role: "user";
     content: string | Array<{ type: string; [k: string]: unknown }>;
   };
+  uuid?: string;
+  session_id?: string;
 }
 
 export interface SDKResultMessage {
@@ -948,15 +950,46 @@ export function handleAgentEvent(
       return undefined;
     }
 
+    case "tool_execution_end": {
+      // Claude stream-json represents a completed tool execution as a user
+      // message containing a `tool_result` block. hapi's timeline reducer
+      // matches this block's tool_use_id to the prior assistant `tool_use`
+      // id and changes the card from running to completed. A top-level result
+      // only ends the turn; it cannot settle individual tool cards.
+      const result = event.result as {
+        content?: Array<{ type?: string; text?: unknown }>;
+        [key: string]: unknown;
+      };
+      const content = Array.isArray(result.content)
+        ? result.content
+            .filter((part) => part?.type === "text")
+            .map((part) => typeof part.text === "string" ? part.text : String(part.text ?? ""))
+            .join("\n")
+        : "";
+      const toolResult: SDKUserMessage = {
+        type: "user",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: event.toolCallId,
+            content,
+            is_error: event.isError,
+          }],
+        },
+        uuid: randomUUID(),
+        session_id: state.emitter.sessionId,
+      };
+      state.emitter.emit(toolResult);
+      return undefined;
+    }
+
     case "tool_execution_start":
     case "tool_execution_update":
-    case "tool_execution_end":
-      // Lifecycle observation only. The matching `tool_use` already
-      // appeared in the prior `assistant` content block (which carries
-      // the `id`), and the tool result is delivered through the next
-      // pi user message. We don't emit a Claude-side user message here
-      // because tool_results in the stream-json wire only appear when
-      // they're part of a synthetic `user` envelope.
+      // The tool_use has already been streamed from the preceding assistant
+      // message. Partial tool output is not part of Claude's assembled SDK
+      // conversation message protocol.
       return undefined;
   }
 

@@ -24,6 +24,9 @@ once and caches its version. That cached version is used by `--version`, the sta
 `system/init`, and session JSONL metadata. Normal shim invocations never refresh it; a failed
 install-time fetch preserves an existing cache or falls back to the bundled version.
 
+T3 Code's no-prompt capability check uses a lightweight protocol path, so account metadata is
+available without loading pi or waiting for the full runtime to initialize.
+
 ## Install
 
 Install as a pi package — one command does the whole job:

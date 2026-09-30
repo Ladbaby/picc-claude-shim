@@ -30,14 +30,12 @@ Install as a pi package — one command does the whole job:
 pi install npm:@ladbabynpm/picc-claude-shim
 ```
 
-`pi install` runs `npm install`, which fires the package's `postinstall` hook (`install.js`). That
-hook writes the `claude.cmd` (Windows), `claude` (POSIX; skipped on Windows unless
-`PI_SHIM_POSIX=1`), and `claude.exe` (Windows, only if one was built) entry wrappers into the first
-writable directory on PATH (`~/.local/bin`, then `~/bin`). These thin wrappers forward to
-`bin/claude.js`. This is the `claude` a host (hapi, T3 Code, the Claude Agent SDK) discovers via
-`which`/`where`.
-
-pi also records `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and
+`pi install` runs `npm install`, which fires the package's `postinstall` hook (`install.js`). The
+hook writes marked `claude.cmd` (Windows), `claude` (POSIX; skipped on Windows unless
+`PI_SHIM_POSIX=1`), and `claude.exe` (Windows) wrappers only to `~/.local/bin` or `~/bin` **when
+that directory is already on `PATH`**. It never replaces another Claude wrapper unless explicitly
+run with `node install.js --force`. These thin wrappers forward to `bin/claude.js`; verify the
+result with: `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and
 loads the `pi.extensions` manifest itself, so no manual registration is needed. Verify with:
 
 ```bash
@@ -120,7 +118,8 @@ node test/run-e2e.mjs
 picc-claude-shim/
 ├── package.json         # @ladbabynpm/picc-claude-shim; jiti dep, pi peer deps
 ├── tsconfig.json
-├── install.js           # postinstall: writes claude.cmd/claude/claude.exe (registers locally when not pi-managed)
+├── install.js           # postinstall entry point
+├── installer-lib.mjs    # hardened wrapper install and local-registration logic
 ├── README.md
 ├── scripts/
 │   ├── build-exe.mjs    # build native claude.exe (Claude Agent SDK spawn path on Windows)

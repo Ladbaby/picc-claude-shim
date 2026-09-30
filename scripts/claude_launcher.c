@@ -34,12 +34,13 @@
 #ifndef PICC_NODE_EXE
 #define PICC_NODE_EXE ""
 #endif
+#define PICC_WRAPPER_MARKER "picc-claude-shim-wrapper:v1"
 
 static const char *SHIM_ROOT = PICC_SHIM_ROOT;
 static const char *NODE_EXE = PICC_NODE_EXE;
 
 static void die(const char *fmt, const char *arg) {
-  fprintf(stderr, "claude.exe (picc-claude-shim): ");
+  fprintf(stderr, "claude.exe (%s): ", PICC_WRAPPER_MARKER);
   fprintf(stderr, fmt, arg ? arg : "");
   fprintf(stderr,
           "\nFix: rebuild with `node scripts/build-exe.mjs`, or set the "

@@ -24,6 +24,7 @@ const tests = [
   "session-resume.test.ts",
   "compact.test.ts",
   "skills.test.ts",
+  "installer.test.mjs",
 ];
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });

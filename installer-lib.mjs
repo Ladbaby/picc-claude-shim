@@ -9,6 +9,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { refreshClaudeCodeVersion } from "./src/version.js";
 
 export const PACKAGE_NAME = "@ladbabynpm/picc-claude-shim";
 export const EXTENSION_NAME = "picc-claude-shim";
@@ -85,10 +86,11 @@ function writeWindowsLauncher(targetDir, shimRoot) {
  * are touched. A source checkout already linked as this extension reuses its
  * own bin directory instead of copying onto itself.
  */
-export function runInstaller({
+export async function runInstaller({
   shimRoot = DEFAULT_SHIM_ROOT,
   agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
   platform = process.platform,
+  fetchImpl,
   log = defaultLog,
 } = {}) {
   const extensionDir = join(agentDir, "extensions", EXTENSION_NAME);
@@ -105,15 +107,19 @@ export function runInstaller({
         throw new Error(`source launcher not found at ${launcher}`);
       }
       log(`launcher already available: ${launcher}`);
-      return true;
-    }
-
-    if (platform === "win32") {
+    } else if (platform === "win32") {
       writeWindowsLauncher(targetDir, shimRoot);
       log(`Windows launcher installed: ${join(targetDir, "claude.exe")}`);
     } else {
       writePosixLauncher(join(targetDir, "claude"), shimRoot);
       log(`POSIX launcher installed: ${join(targetDir, "claude")}`);
+    }
+
+    try {
+      const version = await refreshClaudeCodeVersion({ cacheDir: extensionDir, fetchImpl });
+      log(`Claude Code release version cached: ${version}`);
+    } catch (error) {
+      log(`could not fetch the latest Claude Code release: ${error instanceof Error ? error.message : String(error)}; using the cached or bundled fallback version.`);
     }
     log("configure third-party applications with the path above; no PATH changes were made.");
     return true;

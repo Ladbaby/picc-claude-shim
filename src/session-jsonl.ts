@@ -23,7 +23,7 @@ import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
-import { CLAUDE_CODE_VERSION_BARE } from "./version.js";
+import { getClaudeCodeVersion } from "./version.js";
 
 export interface SessionFileOptions {
   /** hapi spawns claude in this directory; we mimic the path it expects. */
@@ -137,7 +137,7 @@ export function appendSessionEntry(
     userType: "external",
     cwd: input.cwd ?? "",
     sessionId: input.sessionId,
-    version: "0.0.1-pi-claude-shim",
+    version: getClaudeCodeVersion(),
     timestamp: new Date().toISOString(),
     type: input.kind,
     message: input.message,

@@ -55,9 +55,9 @@ import { extractStructuredOutput } from "./structured-output.js";
 import { resolveSkillExpansion } from "./skills.js";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
-import { CLAUDE_CODE_VERSION_LINE } from "./version.js";
+import { getClaudeCodeVersion } from "./version.js";
 
-const PI_VERSION = CLAUDE_CODE_VERSION_LINE;
+const PI_VERSION = `${getClaudeCodeVersion()} (Claude Code)`;
 
 function logStartupBanner(opts: ClaudeShimOptions, mode: string): void {
   process.stderr.write(`pi-claude-shim ${PI_VERSION} mode=${mode}\n`);

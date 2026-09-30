@@ -38,7 +38,7 @@ import {
   type SynthesizedModelUsage,
   type SynthesizedResultFields,
 } from "./cost.js";
-import { CLAUDE_CODE_VERSION_BARE } from "./version.js";
+import { getClaudeCodeVersion } from "./version.js";
 
 // =====================================================================
 // Wire types (Claude Code protocol)
@@ -747,7 +747,7 @@ export function emitSystemInit(
     mcp_servers: [],
     permissionMode: deps.permissionMode ?? "default",
     apiKeySource: "user",
-    claude_code_version: CLAUDE_CODE_VERSION_BARE,
+    claude_code_version: getClaudeCodeVersion(),
     output_style: "default",
     agents: [],
     skills: [],

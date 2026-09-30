@@ -21,10 +21,12 @@
  * be hoisted and defeat the fast path).
  */
 
-import { CLAUDE_CODE_VERSION, CLAUDE_CODE_VERSION_LINE } from "../src/version.js";
+import { getClaudeCodeVersion } from "../src/version.js";
+
+const claudeCodeVersion = getClaudeCodeVersion();
 
 const HELP_TEXT = [
-  `Claude Code ${CLAUDE_CODE_VERSION}`,
+  `Claude Code ${claudeCodeVersion}`,
   "",
   "Usage: claude [options]",
   "",
@@ -59,7 +61,7 @@ const argv = process.argv.slice(2);
 
 // ---- Fast paths (no jiti, no pi runtime) ----
 if (argv.length === 1 && (argv[0] === "--version" || argv[0] === "-v" || argv[0] === "-V")) {
-  process.stdout.write(`${CLAUDE_CODE_VERSION_LINE}\n`);
+  process.stdout.write(`${claudeCodeVersion} (Claude Code)\n`);
   process.exit(0);
 }
 if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {

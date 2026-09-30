@@ -31,16 +31,25 @@ pi install npm:@ladbabynpm/picc-claude-shim
 ```
 
 `pi install` runs `npm install`, which fires the package's `postinstall` hook (`install.js`). The
-hook writes marked `claude.cmd` (Windows), `claude` (POSIX; skipped on Windows unless
-`PI_SHIM_POSIX=1`), and `claude.exe` (Windows) wrappers only to `~/.local/bin` or `~/bin` **when
-that directory is already on `PATH`**. It never replaces another Claude wrapper unless explicitly
-run with `node install.js --force`. These thin wrappers forward to `bin/claude.js`; verify the
-result with: `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and
-loads the `pi.extensions` manifest itself, so no manual registration is needed. Verify with:
+hook creates a dedicated, deterministic launcher directory that does not collide with other
+software and never changes `PATH`:
 
-```bash
-claude --version
+```text
+~/.pi/agent/extensions/picc-claude-shim/bin/
 ```
+
+On Windows, configure third-party applications to execute:
+
+```text
+~/.pi/agent/extensions/picc-claude-shim/bin/claude.exe
+```
+
+The installer writes `picc-claude-shim-root.txt` beside the executable so the copied native
+launcher can resolve its npm-managed runtime after package upgrades. On POSIX systems, configure
+`~/.pi/agent/extensions/picc-claude-shim/bin/claude` instead.
+
+pi also records `npm:@ladbabynpm/picc-claude-shim` in `~/.pi/agent/settings.json#packages` and
+loads the `pi.extensions` manifest itself, so no manual registration is needed.
 
 ## Flags
 
@@ -119,7 +128,7 @@ picc-claude-shim/
 ├── package.json         # @ladbabynpm/picc-claude-shim; jiti dep, pi peer deps
 ├── tsconfig.json
 ├── install.js           # postinstall entry point
-├── installer-lib.mjs    # hardened wrapper install and local-registration logic
+├── installer-lib.mjs    # copies explicit launchers under the pi extension directory
 ├── README.md
 ├── scripts/
 │   ├── build-exe.mjs    # build native claude.exe (Claude Agent SDK spawn path on Windows)

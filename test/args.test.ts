@@ -211,6 +211,13 @@ function main(): void {
     assertEq(o.permissionMode, "bypassPermissions", "skip-permissions -> bypassPermissions");
   }
 
+  // Current Claude SDK full-access spelling.
+  {
+    const o = parseClaudeArgs(["--allow-dangerously-skip-permissions"]);
+    assertEq(o.permissionMode, "bypassPermissions", "allow-skip-permissions -> bypassPermissions");
+    assertArrayEq(o.unrecognized, [], "allow-skip-permissions not unrecognized");
+  }
+
   // Boolean flag: accepted, no value consumed
   {
     const o = parseClaudeArgs([

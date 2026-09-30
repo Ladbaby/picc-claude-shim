@@ -111,6 +111,7 @@ const SHORT_FLAGS = new Set(["-v", "-V", "-h", "-p"]);
  */
 const BOOLEAN_FLAGS = new Set([
   "--dangerously-skip-permissions",
+  "--allow-dangerously-skip-permissions",
   "--include-partial-messages",
   "--strict-mcp-config",
   "--disable-slash-commands",
@@ -185,7 +186,7 @@ export function parseClaudeArgs(argv: readonly string[]): ClaudeShimOptions {
 
     // Boolean flags sent by the SDK: no value follows.
     if (BOOLEAN_FLAGS.has(arg)) {
-      if (arg === "--dangerously-skip-permissions") {
+      if (arg === "--dangerously-skip-permissions" || arg === "--allow-dangerously-skip-permissions") {
         opts.dangerouslySkipPermissions = true;
         // Full-access: the SDK sends this (instead of --permission-mode) to
         // mean bypassPermissions.

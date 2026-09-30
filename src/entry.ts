@@ -271,8 +271,9 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   // only needs to be plausible at init time.
   const initModelId = opts.model ?? "claude-sonnet";
 
-  // 1. Permission gate: open for any non-bypass mode (the SDK drives
-  //    permissions via an in-process canUseTool callback).
+  // Gate each tool call by the mode selected at process startup. Runtime
+  // `set_permission_mode` requests are acknowledged on the control channel;
+  // pi cannot safely replace this session's extension configuration mid-run.
   const gateOpen = computeGateOpen(opts.permissionPromptTool, opts.permissionMode);
 
   // 2. Translator state (stdout emitter + buffers). Eager — needed to emit

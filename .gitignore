@@ -4,3 +4,4 @@ package-lock.json
 config.json
 *.exe
 claude-code-version.json
+extensions/*

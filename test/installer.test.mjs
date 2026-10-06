@@ -128,7 +128,15 @@ await test("runs a copied Windows launcher through its root sidecar", async () =
     const launcher = join(dir, "claude.exe");
     copyFileSync(join(SHIM_ROOT, "bin", "claude.exe"), launcher);
     writeFileSync(join(dir, SHIM_ROOT_FILE), `${resolve(SHIM_ROOT)}\n`, "utf8");
-    assert.equal(execFileSync(launcher, ["--version"], { encoding: "utf8" }).trim(), "1.0.37 (Claude Code)");
+    // Point the launcher at an isolated, empty cache dir so it deterministically
+    // reports the bundled fallback, independent of any live release cache on disk.
+    assert.equal(
+      execFileSync(launcher, ["--version"], {
+        encoding: "utf8",
+        env: { ...process.env, PI_CODING_AGENT_DIR: dir },
+      }).trim(),
+      "1.0.37 (Claude Code)",
+    );
   });
 });
 

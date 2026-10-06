@@ -22,6 +22,7 @@ import {
   type SDKMessageOut,
 } from "../src/translator.js";
 import { synthesizeUsageAndCost } from "../src/cost.js";
+import { getClaudeCodeVersion } from "../src/version.js";
 
 class StringCollector {
   lines: string[] = [];
@@ -87,8 +88,8 @@ assertEq(
 );
 assertEq(
   (init as { claude_code_version?: string }).claude_code_version,
-  "1.0.37",
-  "init claude_code_version",
+  getClaudeCodeVersion(),
+  "init claude_code_version (from version source)",
 );
 assertEq(
   (init as { apiKeySource?: string }).apiKeySource,

@@ -489,9 +489,8 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
       buildPromise = (async () => {
         const askToolName = (fromClaudeToolName("AskUserQuestion") ?? "AskUserQuestion").toLowerCase();
         const buildResult = await buildPiSession(opts, cwd, undefined, wireSessionId, {
-          gateOpen,
           request: (toolCallId, input) => {
-            if (!gateOpen || allowedToolNames.has(askToolName)) {
+            if (allowedToolNames.has(askToolName)) {
               return Promise.resolve(undefined);
             }
             const requestId = emitControlRequest(state, "AskUserQuestion", input as Record<string, unknown>, toolCallId);

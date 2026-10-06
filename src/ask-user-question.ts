@@ -42,8 +42,6 @@ export type AskUserQuestionOutcome =
  * and resolves when the matching `control_response` (or timeout/abort) lands.
  */
 export interface AskUserQuestionHost {
-  /** Whether a control channel can answer (stdio + non-bypass mode). */
-  gateOpen: boolean;
   /** Optional round-trip bound. Defaults to 300_000 ms. */
   timeoutMs?: number;
   request: (
@@ -167,13 +165,6 @@ export function createAskUserQuestionTool(host: AskUserQuestionHost): ToolDefini
       details: string;
     }> {
       const questions = ((params as QuestionParams).questions ?? []);
-
-      if (!host.gateOpen) {
-        return {
-          content: [{ type: "text", text: NO_HOST_MESSAGE }],
-          details: "no_host",
-        };
-      }
 
       const timeoutMs = host.timeoutMs ?? ANSWER_TIMEOUT_MS;
       let timer: ReturnType<typeof setTimeout> | undefined;

@@ -50,6 +50,11 @@ import {
   type SDKMessageOut,
 } from "./translator.js";
 import { fromClaudeToolName } from "./tool-names.js";
+import {
+  createAskUserQuestionTool,
+  type AskUserQuestionHost,
+  type AskUserQuestionOutcome,
+} from "./ask-user-question.js";
 import { synthesizeUsageAndCost } from "./cost.js";
 import { extractStructuredOutput } from "./structured-output.js";
 import { resolveSkillExpansion } from "./skills.js";
@@ -482,7 +487,32 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   const ensureSession = (): Promise<void> => {
     if (!buildPromise) {
       buildPromise = (async () => {
-        const buildResult = await buildPiSession(opts, cwd, undefined, wireSessionId);
+        const askToolName = (fromClaudeToolName("AskUserQuestion") ?? "AskUserQuestion").toLowerCase();
+        const buildResult = await buildPiSession(opts, cwd, undefined, wireSessionId, {
+          gateOpen,
+          request: (toolCallId, input) => {
+            if (!gateOpen || allowedToolNames.has(askToolName)) {
+              return Promise.resolve(undefined);
+            }
+            const requestId = emitControlRequest(state, "AskUserQuestion", input as Record<string, unknown>, toolCallId);
+            return new Promise<AskUserQuestionOutcome>((resolve) => {
+              pending.set(requestId, {
+                requestId,
+                toolName: "AskUserQuestion",
+                toolCallId,
+                input: input as Record<string, unknown>,
+                resolve: (r) => {
+                  pending.delete(requestId);
+                  if (r.behavior === "allow" && r.updatedInput) {
+                    resolve({ answers: (r.updatedInput.answers ?? {}) as Record<string, string | string[]> });
+                  } else {
+                    resolve({ declineMessage: "User declined to answer questions" });
+                  }
+                },
+              });
+            });
+          },
+        });
         if (!buildResult.ok) throw new Error(buildResult.error);
         const s = buildResult.value.session;
         session = s;
@@ -734,6 +764,7 @@ async function buildPiSession(
   cwd: string,
   noTools: "all" | "builtin" | undefined,
   wireSessionId: string,
+  askHost?: AskUserQuestionHost,
 ): Promise<Result<SessionRuntime>> {
   const agentDir = getAgentDir();
   let settingsManager;
@@ -831,6 +862,9 @@ async function buildPiSession(
     };
     if (noTools) createOpts.noTools = noTools;
     if (disallowed.length > 0) createOpts.excludeTools = disallowed;
+    if (askHost) {
+      createOpts.customTools = [createAskUserQuestionTool(askHost)];
+    }
 
     const { session } = await createAgentSession(createOpts);
     return { ok: true, value: { session } };

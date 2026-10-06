@@ -18,6 +18,7 @@ const tests = [
   "session-jsonl.test.ts",
   "cost.test.ts",
   "permission-gate.test.ts",
+  "ask-user-question.test.ts",
   "translator.test.ts",
   "translator-out.test.ts",
   "structured-output.test.ts",

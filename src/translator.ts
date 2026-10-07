@@ -5,7 +5,7 @@
  * ## Output (pi → Claude)
  *
  * pi's `AgentSession.subscribe()` emits:
- *   - `agent_start`, `agent_end`              (lifecycle, no Claude equivalent)
+ *   - `agent_start`, `agent_end`              (query init; result owned by entry)
  *   - `turn_start`, `turn_end`                (no Claude equivalent)
  *   - `message_start`, `message_update`, `message_end`
  *   - `tool_execution_start`, `tool_execution_update`, `tool_execution_end`
@@ -699,6 +699,8 @@ export interface TranslatorState {
   emitter: EmitterContext;
   bufs: Map<string, AssistantBuffer>;
   initEmitted: boolean;
+  /** A wire query spans retries and model turns until final settlement. */
+  queryActive: boolean;
   numTurns: number;
 }
 
@@ -723,13 +725,14 @@ export function createTranslatorState(deps: TranslatorDeps): TranslatorState {
     emitter,
     bufs: new Map(),
     initEmitted: false,
+    queryActive: false,
     numTurns: 0,
   };
 }
 
 /**
- * Emit the initial `system/init` once. hapi explicitly waits for this
- * before consuming subsequent messages.
+ * Emit cheap startup metadata once, without starting a query or building a
+ * session. Real queries subsequently refresh this metadata via emitQueryInit.
  */
 export function emitSystemInit(
   state: TranslatorState,
@@ -737,8 +740,29 @@ export function emitSystemInit(
   deps: TranslatorDeps,
 ): void {
   if (state.initEmitted) return;
+  emitInitMetadata(state, sessionId, deps);
+}
+
+/**
+ * Claude emits init for each query; hapi uses it to restore thinking=true
+ * after the previous result. Retries/queued follow-ups in an active query
+ * must not start another wire query.
+ */
+export function emitQueryInit(
+  state: TranslatorState,
+  sessionId: string,
+  deps: TranslatorDeps,
+): void {
+  if (state.queryActive) return;
+  state.queryActive = true;
+  state.emitter.ended = false;
+  emitInitMetadata(state, sessionId, deps);
+}
+
+function emitInitMetadata(state: TranslatorState, sessionId: string, deps: TranslatorDeps): void {
   state.initEmitted = true;
   state.emitter.sessionId = sessionId;
+  state.emitter.modelId = deps.modelId;
   const msg: SDKSystemInit = {
     type: "system",
     subtype: "init",
@@ -788,7 +812,8 @@ export function handleAgentEvent(
 
   switch (event.type) {
     case "agent_start":
-      // Lifecycle event: Claude has no surface for this, so we drop it.
+      // Starts a wire query only if the previous one has fully settled.
+      emitQueryInit(state, state.emitter.sessionId, deps);
       return undefined;
 
     case "agent_end":
@@ -1036,6 +1061,7 @@ export function emitResult(
     uuid: randomUUID(),
     parent_tool_use_id: null,
   };
+  state.queryActive = false;
   state.emitter.emit(result);
 }
 

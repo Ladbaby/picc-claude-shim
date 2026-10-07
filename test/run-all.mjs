@@ -24,6 +24,7 @@ const tests = [
   "permission-mode-lifecycle.test.ts",
   "translator.test.ts",
   "translator-out.test.ts",
+  "query-init.test.ts",
   "structured-output.test.ts",
   "session-resume.test.ts",
   "compact.test.ts",

@@ -45,6 +45,7 @@ import {
   emitControlRequest,
   emitResult,
   emitSystemInit,
+  emitQueryInit,
   handleAgentEvent as translateAgentEvent,
   handleClaudeInput,
   respondControlRequest,
@@ -325,9 +326,8 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   let sessionBuilt = false;
   /**
    * True while a pi agent run (turn) is in flight — between `agent_start`
-   * and a final `agent_end` (not a retry). Used as the exit gate: the process
-   * stays alive while a turn is running, even after stdin closes, so a long
-   * subagent turn isn't killed mid-flight.
+   * and final `agent_settled` (after compaction/retries). Used as the exit
+   * gate so teardown waits for the running operation to settle.
    */
   let agentActive = false;
   /** Counts per-turn `result` messages emitted; a zero means no completed run. */
@@ -398,11 +398,9 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
 
   // Subscribe the (just-built) session to pi events and translate them.
   const wireSessionEvents = (s: AgentSession): void => {
-    // Emit a Claude `result` message for a completed run (turn). pi fires
-    // `agent_start`…`agent_end` per run, and drains any queued follow-ups
-    // (e.g. background-subagent completion notifications) before `agent_end`,
-    // so one non-retry `agent_end` corresponds to one full Claude turn. We
-    // synthesize usage from pi's cumulative session stats.
+    // Emit a Claude result only at final agent_settled, after all model
+    // turns, queued follow-ups, and compaction/retries. Usage is synthesized
+    // from pi's cumulative session stats.
     const emitTurnResult = (): void => {
       const stats =
         typeof s.getSessionStats === "function" ? s.getSessionStats() : undefined;
@@ -414,6 +412,9 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     s.subscribe((event: AgentSessionEvent) => {
       if (event.type === "message_update" && event.assistantMessageEvent.type === "error") {
         runErrored = true;
+      }
+      if (event.type === "agent_start") {
+        sessionModelId = describeModelId(s);
       }
       translateAgentEvent(state, event, {
         cwd,
@@ -540,6 +541,14 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
       await modeSync.barrier();
       if (!session) return;
       compactInFlight = true; // guard the agent_end handler against the abort() inside compact()
+      sessionModelId = describeModelId(session);
+      emitQueryInit(state, wireSessionId, {
+        cwd,
+        modelId: sessionModelId,
+        toolsAvailable: () => listActiveToolsLowercase(session!),
+        slashCommandsAvailable: () => [],
+        permissionMode: modeSync.mode,
+      });
       try {
         const result = await session.compact(customInstructions);
         // The `compact_boundary` is what T3 reads to (a) render the "Context

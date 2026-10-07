@@ -179,6 +179,7 @@ export interface SDKControlRequest {
     tool_name: string;
     input: Record<string, unknown>;
     permission_suggestions?: unknown[];
+    tool_use_id?: string;
   };
 }
 
@@ -513,7 +514,7 @@ export interface PendingPermission {
   input: Record<string, unknown>;
   resolve: (
     result:
-      | { behavior: "allow"; updatedInput?: Record<string, unknown> }
+      | { behavior: "allow"; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[] }
       | { behavior: "deny"; message: string },
   ) => void;
 }

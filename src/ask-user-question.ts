@@ -16,7 +16,7 @@
  * TUI `AskUserQuestion` (custom tool definitions override same-named extension
  * tools in pi's registry). The tool itself stays deliberately thin — it only
  * awaits `host.request` and maps the outcome to Claude's canonical result
- * string. All the `control_request`/`pending`/timeout wiring lives in
+ * string. All the control_request/pending wiring lives in
  * `entry.ts`, which owns the translator state.
  */
 
@@ -33,17 +33,15 @@ export type AskAnswers = Record<string, string | string[]>;
 export type AskUserQuestionOutcome =
   | { answers: AskAnswers }
   | { declineMessage: string }
-  /** No host, gate closed, or timed out → the tool degrades to "decide". */
+  /** No supported host transport was provided. */
   | undefined;
 
 /**
  * Narrow contract `entry.ts` supplies. `request` registers the round-trip in
  * the translator's `pending` map, emits the `can_use_tool` control_request,
- * and resolves when the matching `control_response` (or timeout/abort) lands.
+ * and resolves when the matching control_response or explicit cancellation lands.
  */
 export interface AskUserQuestionHost {
-  /** Optional round-trip bound. Defaults to 300_000 ms. */
-  timeoutMs?: number;
   request: (
     toolCallId: string,
     input: { questions: unknown[] },
@@ -133,7 +131,6 @@ export function formatAnsweredResult(
 }
 
 const DECLINE_MESSAGE = "User declined to answer questions";
-const ANSWER_TIMEOUT_MS = 300_000;
 const NO_HOST_MESSAGE =
   "You are running without an interactive host and cannot present these " +
   "questions. Make a reasonable decision on your own, state the assumption " +
@@ -166,17 +163,9 @@ export function createAskUserQuestionTool(host: AskUserQuestionHost): ToolDefini
     }> {
       const questions = ((params as QuestionParams).questions ?? []);
 
-      const timeoutMs = host.timeoutMs ?? ANSWER_TIMEOUT_MS;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timeout = new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), timeoutMs);
-        timer.unref?.();
-      });
-      const outcome = await Promise.race([
-        host.request(toolCallId, { questions }, signal),
-        timeout,
-      ]);
-      if (timer) clearTimeout(timer);
+      // A displayed question is pending human input, not a missing host.
+      // Wait until the host answers, cancels, or closes the session.
+      const outcome = await host.request(toolCallId, { questions }, signal);
 
       if (outcome == null) {
         return {

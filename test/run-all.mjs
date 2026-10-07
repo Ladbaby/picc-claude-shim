@@ -19,6 +19,7 @@ const tests = [
   "cost.test.ts",
   "permission-gate.test.ts",
   "ask-user-question.test.ts",
+  "host-tools.test.ts",
   "translator.test.ts",
   "translator-out.test.ts",
   "structured-output.test.ts",
@@ -37,7 +38,7 @@ for (const t of tests) {
   // a synchronous require call because the tests are top-level
   // expressions.
   const mod = await jiti.import(`./${t}`);
-  void mod;
+  if (typeof mod.run === "function") await mod.run();
 }
 
 process.on("exit", (code) => {

@@ -15,6 +15,7 @@
  */
 
 import {
+  createEventBus,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
@@ -53,8 +54,8 @@ import { fromClaudeToolName } from "./tool-names.js";
 import {
   createAskUserQuestionTool,
   type AskUserQuestionHost,
-  type AskUserQuestionOutcome,
 } from "./ask-user-question.js";
+import { requestHostTool, type HostDecision } from "./host-tools.js";
 import { synthesizeUsageAndCost } from "./cost.js";
 import { extractStructuredOutput } from "./structured-output.js";
 import { resolveSkillExpansion } from "./skills.js";
@@ -487,31 +488,19 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   const ensureSession = (): Promise<void> => {
     if (!buildPromise) {
       buildPromise = (async () => {
-        const askToolName = (fromClaudeToolName("AskUserQuestion") ?? "AskUserQuestion").toLowerCase();
         const buildResult = await buildPiSession(opts, cwd, undefined, wireSessionId, {
-          request: (toolCallId, input) => {
-            if (allowedToolNames.has(askToolName)) {
-              return Promise.resolve(undefined);
+          request: async (toolCallId, input, signal) => {
+            // Question answers are never pre-approved by --allowedTools or bypass.
+            const decision = await requestHostTool(state, pending, "AskUserQuestion", toolCallId, input, signal);
+            if (decision.behavior === "deny") return { declineMessage: decision.message };
+            const answers = decision.updatedInput?.answers;
+            if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+              return { declineMessage: "No answers were provided." };
             }
-            const requestId = emitControlRequest(state, "AskUserQuestion", input as Record<string, unknown>, toolCallId);
-            return new Promise<AskUserQuestionOutcome>((resolve) => {
-              pending.set(requestId, {
-                requestId,
-                toolName: "AskUserQuestion",
-                toolCallId,
-                input: input as Record<string, unknown>,
-                resolve: (r) => {
-                  pending.delete(requestId);
-                  if (r.behavior === "allow" && r.updatedInput) {
-                    resolve({ answers: (r.updatedInput.answers ?? {}) as Record<string, string | string[]> });
-                  } else {
-                    resolve({ declineMessage: "User declined to answer questions" });
-                  }
-                },
-              });
-            });
+            return { answers: answers as Record<string, string | string[]> };
           },
-        });
+        }, (toolName, toolCallId, input, signal) =>
+          requestHostTool(state, pending, toolName, toolCallId, input, signal));
         if (!buildResult.ok) throw new Error(buildResult.error);
         const s = buildResult.value.session;
         session = s;
@@ -764,6 +753,9 @@ async function buildPiSession(
   noTools: "all" | "builtin" | undefined,
   wireSessionId: string,
   askHost?: AskUserQuestionHost,
+  planHost?: (
+    toolName: string, toolCallId: string, input: Record<string, unknown>, signal?: AbortSignal,
+  ) => Promise<HostDecision>,
 ): Promise<Result<SessionRuntime>> {
   const agentDir = getAgentDir();
   let settingsManager;
@@ -781,10 +773,28 @@ async function buildPiSession(
     };
   }
 
+  const eventBus = createEventBus();
+  if (planHost) {
+    // In-process contract shared with picc-permission-modes/headlessPlanHost.ts.
+    eventBus.on("picc:plan-host:request", (data) => {
+      const request = data as {
+        toolName: "EnterPlanMode" | "ExitPlanMode";
+        toolCallId: string;
+        input: Record<string, unknown>;
+        signal?: AbortSignal;
+        handled: boolean;
+        respond: (decision: HostDecision) => void;
+      };
+      request.handled = true;
+      void planHost(request.toolName, request.toolCallId, request.input, request.signal)
+        .then(request.respond, (error: unknown) => request.respond({ behavior: "deny", message: String(error) }));
+    });
+  }
   const loaderOptions: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
     cwd,
     agentDir,
     settingsManager,
+    eventBus,
   };
   if (opts.systemPrompt !== undefined) {
     const sp = opts.systemPrompt;

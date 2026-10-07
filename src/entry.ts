@@ -56,6 +56,7 @@ import {
   type AskUserQuestionHost,
 } from "./ask-user-question.js";
 import { requestHostTool, type HostDecision } from "./host-tools.js";
+import { applyHostMode, PermissionModeSync } from "./permission-mode-sync.js";
 import { synthesizeUsageAndCost } from "./cost.js";
 import { extractStructuredOutput } from "./structured-output.js";
 import { resolveSkillExpansion } from "./skills.js";
@@ -278,10 +279,11 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   // only needs to be plausible at init time.
   const initModelId = opts.model ?? "claude-sonnet";
 
-  // Gate each tool call by the mode selected at process startup. Runtime
-  // `set_permission_mode` requests are acknowledged on the control channel;
-  // pi cannot safely replace this session's extension configuration mid-run.
-  const gateOpen = computeGateOpen(opts.permissionPromptTool, opts.permissionMode);
+  // Mode controls update the live extension without reloading it. Before the
+  // first prompt, they only stage configuration so capability probes stay cheap.
+  const modeSync = new PermissionModeSync(opts.permissionMode ?? "default");
+  const modeLifetime = new AbortController();
+  const gateOpen = () => computeGateOpen(opts.permissionPromptTool, modeSync.mode);
   // Claude Code's --allowedTools is a pre-approval rule list. Keep this
   // separate from pi's active-tool selection, which is handled when the
   // session is constructed below.
@@ -378,7 +380,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
     // deferred; exact tool-name rules are the safe common denominator and
     // cover hapi's MCP title tool plus normal SDK use.
     if (allowedToolNames.has(toolName.toLowerCase())) return { behavior: "allow" };
-    if (!gateOpen) return { behavior: "allow" };
+    if (!gateOpen()) return { behavior: "allow" };
     const requestId = emitControlRequest(state, toolName, input, toolCallId);
     return new Promise((resolve) => {
       pending.set(requestId, {
@@ -418,8 +420,8 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
         modelId: sessionModelId,
         toolsAvailable: () => listActiveToolsLowercase(s),
         slashCommandsAvailable: () => [],
-        permissionMode: opts.permissionMode ?? "default",
-      }, gateOpen ? permissionAsk : undefined);
+        permissionMode: modeSync.mode,
+      }, gateOpen() ? permissionAsk : undefined);
 
       if (event.type === "agent_start") {
         agentActive = true;
@@ -512,6 +514,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
           modelId: sessionModelId,
         });
         wireSessionEvents(s);
+        await modeSync.attach((mode) => buildResult.value.setPermissionMode(mode, modeLifetime.signal));
         sessionBuilt = true;
         process.stderr.write(
           `pi-claude-shim: pi session ready with tools: ${listActiveToolsLowercase(s).join(", ") || "(none)"}\n`,
@@ -529,10 +532,12 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   //     prose and no compaction happens. So we intercept it here and drive
   //     pi's own `session.compact()`, then emit the same messages the host
   //     expects to settle the compaction.
-  const handleCompactCommand = async (customInstructions: string | undefined): Promise<void> => {
+  const handleCompactCommand = async (customInstructions: string | undefined, modeBarrier: Promise<void>): Promise<void> => {
     if (compactInFlight) return; // a compact already running; drop the duplicate
     try {
+      await modeBarrier;
       await ensureSession();
+      await modeSync.barrier();
       if (!session) return;
       compactInFlight = true; // guard the agent_end handler against the abort() inside compact()
       try {
@@ -606,6 +611,15 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
       handleClaudeInput(line, {
         pendingPermissions: pending,
         respondControlRequest: (requestId: string, request: { subtype: string; [k: string]: unknown }) => {
+          if (request.subtype === "set_permission_mode") {
+            void modeSync.setMode(request.mode).then(() => {
+              respondControlRequest(state, requestId, request);
+            }, (error: unknown) => state.emitter.emit({
+              type: "control_response",
+              response: { subtype: "error", request_id: requestId, error: String(error) },
+            }));
+            return;
+          }
           try {
             respondControlRequest(state, requestId, request);
           } catch (e) {
@@ -618,6 +632,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
           void cancelActiveRun();
         },
         onUserMessage: (text: string) => {
+          const modeBarrier = modeSync.barrier();
           // A later user turn after an interrupt is a fresh run.
           cancellationRequested = false;
           cancellationPromise = null;
@@ -626,14 +641,16 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
           // to pi as a prompt (that would be answered as prose, not compact).
           const compactInstructions = parseCompactCommand(text);
           if (compactInstructions !== null) {
-            void handleCompactCommand(compactInstructions);
+            void handleCompactCommand(compactInstructions, modeBarrier);
             return;
           }
           // Kick off the (one-time) pi session build, then prompt. The probe
           // never reaches here, so this ~30s cost is paid only for real runs.
           void (async () => {
             try {
+              await modeBarrier;
               await ensureSession();
+              await modeSync.barrier();
               if (!session || !sessionFile || cancellationRequested) return;
               // A `/<skill>` turn is expanded into the prompt Claude Code would
               // have sent (SKILL.md body + args). The transcript still records
@@ -673,6 +690,8 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
   let stdinClosed = false;
   rl.on("close", () => {
     stdinClosed = true;
+    modeSync.close();
+    modeLifetime.abort();
     void cancelActiveRun();
   });
 
@@ -745,6 +764,7 @@ type Result<T> = { ok: true; value: T } | { ok: false; error: string };
 
 interface SessionRuntime {
   session: AgentSession;
+  setPermissionMode: (mode: ClaudePermissionMode, signal: AbortSignal) => Promise<void>;
 }
 
 async function buildPiSession(
@@ -876,7 +896,20 @@ async function buildPiSession(
     }
 
     const { session } = await createAgentSession(createOpts);
-    return { ok: true, value: { session } };
+    if (planHost) {
+      eventBus.on("picc:plan-host:capability", (data) => {
+        const probe = data as { sessionId: string; available: boolean };
+        if (probe.sessionId === session.sessionId) probe.available = true;
+      });
+    }
+    return { ok: true, value: {
+      session,
+      setPermissionMode: (mode, signal) => {
+        const ctx = session.extensionRunner?.createContext();
+        if (!ctx) return Promise.reject(new Error("Permission extension runner is unavailable."));
+        return applyHostMode(eventBus, ctx, mode, signal);
+      },
+    } };
   } catch (e) {
     return {
       ok: false,

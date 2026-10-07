@@ -20,6 +20,8 @@ const tests = [
   "permission-gate.test.ts",
   "ask-user-question.test.ts",
   "host-tools.test.ts",
+  "permission-mode-sync.test.ts",
+  "permission-mode-lifecycle.test.ts",
   "translator.test.ts",
   "translator-out.test.ts",
   "structured-output.test.ts",

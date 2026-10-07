@@ -1185,9 +1185,9 @@ export function buildControlResponsePayload(
       };
     }
     case "set_permission_mode": {
-      // The current SDK accepts a successful acknowledgement, but newer hosts
-      // may inspect the acknowledgement payload. Echo the applied mode, as
-      // Claude Code does, and persist it on TranslatorState for observability.
+      // Pure response formatting only. entry.ts validates and awaits the
+      // extension transition (or stages pre-session configuration) before
+      // calling this responder; formatting alone never applies a mode.
       const mode = typeof request.mode === "string" ? request.mode : "default";
       return { mode };
     }

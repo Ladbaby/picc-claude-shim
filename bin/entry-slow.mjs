@@ -37,15 +37,21 @@
  *   4. the npm global root (`npm root -g`),
  *   5. pi's own managed roots (`~/.pi/agent/npm/node_modules`,
  *      `~/.pi/agent/node_modules`, `~/.pi/node_modules`).
+ *
+ * Resolving `typebox`
+ * -------------------
+ * `src/ask-user-question.ts` imports `Type` from `typebox` as a *value*. That is
+ * not a dependency of this package, and pi only makes it resolvable through its
+ * extension loader's alias map — which does not exist in a standalone process.
+ * So we reproduce that map here, resolving `typebox` (and its subpaths) against
+ * pi's own install. See {@link buildJitiAliases}.
  */
 
 import { createJiti } from "jiti";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureLauncher } from "../installer-lib.mjs";
-import { resolvePiPkgDir } from "./pi-resolve.mjs";
-
-const PI_PKG = "@earendil-works/pi-coding-agent";
+import { buildJitiAliases, resolvePiPkgDir } from "./pi-resolve.mjs";
 
 // Make sure the documented, deterministic launcher directory exists even when
 // the package's postinstall hook did not run. This is network-free and
@@ -55,14 +61,25 @@ if (!process.env.PICC_CLAUDE_SHIM_DISABLE_SELF_INSTALL) {
   ensureLauncher({ shimRoot: dirname(dirname(fileURLToPath(import.meta.url))) });
 }
 
-function buildJiti() {
+/**
+ * Build the jiti instance used to transpile `src/entry.ts`.
+ *
+ * Aliases (see {@link buildJitiAliases}):
+ *  - the pi package specifier → pi's install directory, so its own `exports`
+ *    entry (`dist/index.js`) and nested deps are used;
+ *  - `typebox` and its subpaths → pi's copy. `typebox` is a *value* import in
+ *    `src/ask-user-question.ts`, is not a dependency of this package, and has
+ *    no bare-specifier mapping outside pi — without the alias a standalone run
+ *    dies at module load with `Cannot find module 'typebox'`.
+ *
+ * Exported so tests can assert the alias map and load the module graph.
+ */
+export function buildJiti() {
   const options = { interopDefault: true };
   const piDir = resolvePiPkgDir();
-  if (piDir) {
-    // Alias the bare specifier to pi's install directory so its own `main`
-    // / `exports` (ESM `dist/index.js`) are used, and its nested deps resolve
-    // against pi's own `node_modules`.
-    options.alias = { [PI_PKG]: piDir };
+  const aliases = buildJitiAliases(piDir);
+  if (Object.keys(aliases).length > 0) {
+    options.alias = aliases;
   }
   return createJiti(import.meta.url, options);
 }

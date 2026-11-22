@@ -18,12 +18,33 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const PI_PKG = "@earendil-works/pi-coding-agent";
 export const PI_MAIN_REL = join("dist", "index.js");
+
+/**
+ * Bare specifiers pi's extension loader maps to its own copies of `typebox`
+ * (see `getAliases()` in pi's `dist/core/extensions/loader.js`). The shim's
+ * `src/` uses `typebox` as a *value* import (`ask-user-question.ts`), and it is
+ * neither a dependency of this package nor installable here — inside pi the
+ * loader provides the mapping, standalone we have to reproduce it.
+ */
+const TYPEBOX_PKGS = ["typebox", "@sinclair/typebox"];
+const TYPEBOX_SUBPATHS = [
+  "",
+  "/compile",
+  "/value",
+  "/error",
+  "/format",
+  "/guard",
+  "/schema",
+  "/system",
+  "/type",
+];
 
 /** True when `dir` looks like a complete pi-coding-agent install. */
 export function looksLikePiPkgDir(dir) {
@@ -166,4 +187,73 @@ export function resolvePiPkgDir({ env = process.env, selfDir, includeNpmGlobal =
     if (looksLikePiPkgDir(dir)) return dir;
   }
   return null;
+}
+
+/**
+ * Build the jiti alias entries that map `typebox` (and its subpaths) to pi's
+ * own copy, mirroring pi's extension loader.
+ *
+ * `typebox` has no `main` field and resolves through `exports` subpaths, so
+ * aliasing the bare directory does not work — jiti would fail deeper in the
+ * graph (`Cannot find module '.../typebox/build/index.mjs/compile'`). Resolving
+ * each specifier through a `createRequire` anchored at pi's `package.json`
+ * yields real file paths and honours whatever `exports` map the installed
+ * version declares. Subpaths the installed version does not export are simply
+ * omitted, and any failure leaves the alias out so default resolution applies.
+ *
+ * The legacy `@sinclair/typebox` specifier is aliased to the same files when
+ * neither the package nor pi ships that name — pi's loader does the same, so
+ * extensions importing either name behave identically.
+ *
+ * @param {object} [options]
+ * @param {string|null} [options.piDir] pi-coding-agent directory (see {@link resolvePiPkgDir})
+ * @param {string[]} [options.packages] bare package names to alias
+ * @param {string[]} [options.subpaths] subpath suffixes (`""` = the root entry)
+ * @returns {Record<string, string>} specifier → absolute file path
+ */
+export function resolveTypeboxAliases({
+  piDir,
+  packages = TYPEBOX_PKGS,
+  subpaths = TYPEBOX_SUBPATHS,
+} = {}) {
+  const aliases = {};
+  if (typeof piDir !== "string" || piDir.length === 0) return aliases;
+  let piRequire;
+  try {
+    piRequire = createRequire(join(piDir, "package.json"));
+  } catch {
+    return aliases;
+  }
+  for (const pkg of packages) {
+    for (const subpath of subpaths) {
+      const specifier = `${pkg}${subpath}`;
+      try {
+        aliases[specifier] = piRequire.resolve(specifier);
+      } catch {
+        // Not exported by this typebox version — leave it unaliased.
+      }
+    }
+  }
+  // pi aliases the legacy `@sinclair/typebox` specifier to its own `typebox`
+  // copy. Recent installs ship only `typebox`, so fall back to that entry for
+  // parity instead of silently leaving the legacy specifier unresolvable.
+  for (const subpath of subpaths) {
+    const legacy = `@sinclair/typebox${subpath}`;
+    if (!aliases[legacy] && aliases[`typebox${subpath}`]) {
+      aliases[legacy] = aliases[`typebox${subpath}`];
+    }
+  }
+  return aliases;
+}
+
+/**
+ * Full jiti alias map used by `entry-slow.mjs`: pi itself plus the `typebox`
+ * copy that lives in pi's install.
+ *
+ * @param {string|null} piDir pi-coding-agent directory
+ * @returns {Record<string, string>} specifier → path (empty when `piDir` is null)
+ */
+export function buildJitiAliases(piDir) {
+  if (typeof piDir !== "string" || piDir.length === 0) return {};
+  return { [PI_PKG]: piDir, ...resolveTypeboxAliases({ piDir }) };
 }

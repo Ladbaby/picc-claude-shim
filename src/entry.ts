@@ -54,6 +54,7 @@ import {
 import { fromClaudeToolName } from "./tool-names.js";
 import {
   createAskUserQuestionTool,
+  type AskAnswers,
   type AskUserQuestionHost,
 } from "./ask-user-question.js";
 import { requestHostTool, type HostDecision } from "./host-tools.js";
@@ -500,7 +501,7 @@ async function runStreamJson(opts: ClaudeShimOptions, cwd: string): Promise<numb
             if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
               return { declineMessage: "No answers were provided." };
             }
-            return { answers: answers as Record<string, string | string[]> };
+            return { answers: answers as AskAnswers };
           },
         }, (toolName, toolCallId, input, signal) =>
           requestHostTool(state, pending, toolName, toolCallId, input, signal));

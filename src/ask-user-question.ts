@@ -26,8 +26,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-/** Answer map as hapi ships it: keyed by question text, values comma-joined. */
-export type AskAnswers = Record<string, string | string[]>;
+/**
+ * Answer map as hosts actually ship it.
+ *
+ * Keying varies by host — Claude's own permission UI uses the exact question
+ * text, hapi's web UI uses the question index, T3 Code uses its own question
+ * ids — and values are either a joined string or a `string[]` (codex nests
+ * them one level deeper). `formatAnsweredResult` resolves all of these.
+ */
+export type AskAnswers = Record<string, unknown>;
 
 /** Outcome of a host permission round-trip for AskUserQuestion. */
 export type AskUserQuestionOutcome =
@@ -112,22 +119,109 @@ type QuestionParams = {
   }>;
 };
 
-/** Normalize a possibly-array answer value to a comma-joined string. */
-function toAnswerString(value: string | string[] | undefined): string {
+/**
+ * Flatten one host-supplied answer value into a plain string.
+ *
+ * Hosts disagree on both the key and the value shape:
+ *   - Claude's built-in tool: `string` (multi-select already comma-joined)
+ *   - hapi: `string[]`
+ *   - codex `request_user_input`: `{ answers: string[] }`
+ * Anything unrecognized degrades to an empty string rather than throwing.
+ */
+function toAnswerString(value: unknown): string {
   if (value == null) return "";
-  if (Array.isArray(value)) return value.join(", ");
-  return value;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .join(", ");
+  }
+  if (typeof value === "object") {
+    const nested = value as { answers?: unknown; selected?: unknown };
+    return toAnswerString(nested.answers ?? nested.selected);
+  }
+  return String(value);
 }
 
-/** Build Claude's canonical "answered" result string from a host answer map. */
+/** Collapse whitespace so key matching does not hinge on formatting drift. */
+function normalizeKey(key: string): string {
+  return key.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Resolve the host's answer for one question.
+ *
+ * Claude Code's own tool never does this — it echoes `Object.entries(answers)`
+ * verbatim because its permission UI always keys by exact question text. We
+ * cannot assume that: hapi's web UI submits `Record<questionIndex, string[]>`
+ * and T3 Code keys by its own question ids, so looking up the raw text alone
+ * silently misses every question and yields a result full of `""`.
+ *
+ * Candidates are tried most-specific-first: exact text, whitespace-normalized
+ * text, header, then index-keyed forms (`"0"`, `"q-0"`, `"q-0"`-style ids).
+ */
+function resolveAnswer(
+  question: QuestionParams["questions"][number] | undefined,
+  index: number,
+  answers: AskAnswers,
+  normalized: Map<string, unknown>,
+): string {
+  const candidates: string[] = [];
+  if (question) {
+    candidates.push(question.question, question.header);
+  }
+  candidates.push(String(index), `q-${index}`);
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate.length === 0) continue;
+    const direct = Object.prototype.hasOwnProperty.call(answers, candidate)
+      ? answers[candidate]
+      : undefined;
+    const keyed = direct ?? normalized.get(normalizeKey(candidate));
+    const text = toAnswerString(keyed);
+    if (text.trim().length > 0) return text;
+  }
+  return "";
+}
+
+/**
+ * Build Claude's canonical "answered" result string from a host answer map.
+ *
+ * Only questions we actually resolved a non-empty answer for are emitted. A
+ * result of `"Q"=""` for every question reads to the model as "the user chose
+ * empty string" and strands the turn, which is exactly the bug this guards.
+ *
+ * If nothing resolves but the host did send non-empty answers under keys we
+ * don't understand, echo them verbatim (which is all real Claude Code ever
+ * does) rather than claiming the user declined — losing a real answer is worse
+ * than an unusually-keyed one. Only a genuinely empty answer set declines.
+ */
 export function formatAnsweredResult(
   questions: QuestionParams["questions"],
   answers: AskAnswers,
 ): string {
-  const lines = questions
-    .map((q) => `"${q.question}"="${toAnswerString(answers[q.question])}"`)
-    .join(", ");
-  return `User has answered your questions: ${lines}. You can now continue with the user's answers in mind.`;
+  const normalized = new Map<string, unknown>();
+  const rawNonEmpty: string[] = [];
+  for (const [key, value] of Object.entries(answers)) {
+    const norm = normalizeKey(key);
+    if (norm.length > 0 && !normalized.has(norm)) normalized.set(norm, value);
+    const text = toAnswerString(value);
+    if (text.trim().length > 0) rawNonEmpty.push(`"${key}"="${text}"`);
+  }
+
+  const lines: string[] = [];
+  for (let i = 0; i < questions.length; i++) {
+    const question = questions[i];
+    const answer = resolveAnswer(question, i, answers, normalized);
+    if (answer.length === 0) continue;
+    lines.push(`"${question.question}"="${answer}"`);
+  }
+
+  if (lines.length === 0) {
+    if (rawNonEmpty.length === 0) return DECLINE_MESSAGE;
+    return `User has answered your questions: ${rawNonEmpty.join(", ")}. You can now continue with the user's answers in mind.`;
+  }
+  return `User has answered your questions: ${lines.join(", ")}. You can now continue with the user's answers in mind.`;
 }
 
 const DECLINE_MESSAGE = "User declined to answer questions";

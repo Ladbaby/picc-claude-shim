@@ -20,6 +20,48 @@ export async function run(): Promise<void> {
   const empty = createAskUserQuestionTool({ request: async () => ({ declineMessage: "" }) });
   assert.equal(text(await empty.execute("empty", input, undefined, undefined, context)), "User declined to answer questions");
 
+  // hapi's web UI submits `Record<questionIndex, string[]>`, and other hosts
+  // key by header or by their own question ids. A pure question-text lookup
+  // missed every one of them and emitted `"Q"=""` for each question, which
+  // reads to the model as "the user answered empty string" and strands the
+  // turn. Every host shape below must resolve to the real answer.
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["index-keyed string[] (hapi web)", { "0": ["A"] }],
+    ["index-keyed string", { "0": "A" }],
+    ["header-keyed", { Library: ["A"] }],
+    ["q-index-keyed id", { "q-0": "A" }],
+    ["nested codex shape", { "0": { answers: ["A"] } }],
+    ["whitespace-drifted text key", { "  Which   library? ": "A" }],
+  ];
+  for (const [label, answers] of cases) {
+    assert.match(
+      formatAnsweredResult(input.questions, answers),
+      /"Which library\?"="A"/,
+      `${label} must resolve to the selected option`,
+    );
+  }
+
+  // An answer map whose keys we cannot match must never fabricate `=""`
+  // answers, and must not claim the user declined when they actually answered:
+  // echoing the raw key/value is what real Claude Code does, and losing a real
+  // answer is worse than relaying an unusually-keyed one.
+  const unmatched = formatAnsweredResult(input.questions, { unrelated: "x" });
+  assert.doesNotMatch(unmatched, /=""/);
+  assert.match(unmatched, /"unrelated"="x"/);
+
+  // A genuinely empty answer map is the only real decline.
+  const none = formatAnsweredResult(input.questions, {});
+  assert.equal(none, "User declined to answer questions");
+
+  // Partial resolution emits only the questions actually answered.
+  const twoQuestions = [
+    { question: "First?", header: "One", options: [{ label: "A", description: "a" }, { label: "B", description: "b" }] },
+    { question: "Second?", header: "Two", options: [{ label: "C", description: "c" }, { label: "D", description: "d" }] },
+  ];
+  const partial = formatAnsweredResult(twoQuestions, { "1": ["C"] });
+  assert.match(partial, /"Second\?"="C"/);
+  assert.doesNotMatch(partial, /First\?/);
+
   // Advance the old five-minute deadline without sleeping. Any scheduled
   // timeout would fire here; a delayed human answer must still be accepted.
   const originalSetTimeout = globalThis.setTimeout;
